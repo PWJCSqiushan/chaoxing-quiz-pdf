@@ -475,6 +475,15 @@ class Chaoxing:
             )
             text = (resp.text or "").strip()
             logger.debug(f"getIdentifyCode 原始响应: {text[:300]}")
+            # 落盘完整响应，便于确认是否为验证码/验证页
+            try:
+                import os
+                d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "debug_identify.html"), "w", encoding="utf-8") as f:
+                    f.write(f"REQUEST_URL: {resp.url}\nSTATUS: {resp.status_code}\n\n{resp.text}")
+            except Exception:
+                pass
             # 优先严格 JSON
             try:
                 data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
