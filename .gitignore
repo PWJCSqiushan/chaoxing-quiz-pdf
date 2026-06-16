@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行期数据（含敏感信息，切勿提交）
+users.db
+users.db-wal
+users.db-shm
+sessions/
+cookies*.txt
+output/*.pdf
+*.log
+
+# 前端构建
+web/node_modules/
+web/dist/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

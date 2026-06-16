@@ -1,0 +1,10 @@
+requests>=2.32.0
+pyaes>=1.6.1
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+fonttools>=4.50.0
+flask>=3.0.0
+flask-cors>=5.0.0
+fpdf2>=2.8.0
+loguru>=0.7.0
+tqdm>=4.66.0

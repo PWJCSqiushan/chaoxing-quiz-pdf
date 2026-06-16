@@ -1,0 +1,396 @@
+# -*- coding: utf-8 -*-
+"""
+超星学习通数据解析模块（精简版）
+
+负责解析超星平台的课程、章节、任务点、题目等数据，并转换为结构化数据。
+相比 chaoxing-fanya 原版，本版本移除了视频/直播任务的复杂处理与本地 OCR 依赖，
+仅保留 PDF 抽题所需的最小解析能力，并完整保留题目解析 + 字体反加密逻辑。
+"""
+import json
+import re
+from typing import List, Dict, Tuple, Any, Optional, Union
+
+from bs4 import BeautifulSoup, NavigableString
+
+from api.font_decoder import FontDecoder
+from api.logger import logger
+
+
+# ==================== 通用工具 ====================
+
+def _normalize_bool(value: Union[str, bool, int, float]) -> bool:
+    """统一转换布尔值，避免字符串 'false' 被当成 True"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "passed"}
+    return False
+
+
+# ==================== 课程列表 ====================
+
+def decode_course_list(html_text: str) -> List[Dict[str, str]]:
+    """解析课程列表页面，提取课程信息"""
+    logger.trace("开始解码课程列表...")
+    soup = BeautifulSoup(html_text, "lxml")
+    raw_courses = soup.select("div.course")
+    course_list = []
+
+    for course in raw_courses:
+        # 跳过未开放课程
+        if course.select_one("a.not-open-tip") or course.select_one("div.not-open-tip"):
+            continue
+        try:
+            course_detail = {
+                "id": course.attrs.get("id", ""),
+                "info": course.attrs.get("info", ""),
+                "roleid": course.attrs.get("roleid", ""),
+                "clazzId": course.select_one("input.clazzId").attrs["value"],
+                "courseId": course.select_one("input.courseId").attrs["value"],
+                "cpi": re.findall(r"cpi=(.*?)&", course.select_one("a").attrs["href"])[0],
+                "title": course.select_one("span.course-name").attrs["title"],
+                "desc": course.select_one("p.margint10").attrs["title"] if course.select_one("p.margint10") else "",
+                "teacher": course.select_one("p.color3").attrs["title"] if course.select_one("p.color3") else "",
+            }
+        except (AttributeError, KeyError, IndexError) as e:
+            logger.debug(f"跳过无法解析的课程条目: {e}")
+            continue
+        course_list.append(course_detail)
+
+    return course_list
+
+
+def decode_course_folder(html_text: str) -> List[Dict[str, str]]:
+    """解析二级课程列表页面，提取文件夹信息"""
+    logger.trace("开始解码二级课程列表...")
+    soup = BeautifulSoup(html_text, "lxml")
+    raw_courses = soup.select("ul.file-list>li")
+    course_folder_list = []
+
+    for course in raw_courses:
+        if not course.attrs.get("fileid"):
+            continue
+        rename_input = course.select_one("input.rename-input")
+        course_folder_list.append({
+            "id": course.attrs["fileid"],
+            "rename": rename_input.attrs["value"] if rename_input else "",
+        })
+
+    return course_folder_list
+
+
+# ==================== 章节列表 ====================
+
+def decode_course_point(html_text: str) -> Dict[str, Any]:
+    """解析章节列表页面，提取章节点信息"""
+    logger.trace("开始解码章节列表...")
+    soup = BeautifulSoup(html_text, "lxml")
+    course_point: Dict[str, Any] = {"hasLocked": False, "points": []}
+
+    for chapter_unit in soup.find_all("div", class_="chapter_unit"):
+        points = _extract_points_from_chapter(chapter_unit)
+        for point in points:
+            if point.get("need_unlock", False):
+                course_point["hasLocked"] = True
+        course_point["points"].extend(points)
+
+    return course_point
+
+
+def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
+    """从章节单元中提取章节点信息"""
+    point_list = []
+    raw_points = chapter_unit.find_all("li")
+
+    for raw_point in raw_points:
+        point = raw_point.div
+        if not point or "id" not in point.attrs:
+            continue
+
+        m = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])
+        if not m:
+            continue
+        point_id = m[0]
+        title_el = point.select_one("a.clicktitle")
+        point_title = title_el.text.replace("\n", "").strip() if title_el else ""
+
+        job_count = 1
+        need_unlock = False
+        if point.select_one("input.knowledgeJobCount"):
+            job_count = point.select_one("input.knowledgeJobCount").attrs["value"]
+        elif point.select_one("span.bntHoverTips") and "解锁" in point.select_one("span.bntHoverTips").text:
+            need_unlock = True
+
+        is_finished = False
+        if point.select_one("span.bntHoverTips") and "已完成" in point.select_one("span.bntHoverTips").text:
+            is_finished = True
+
+        point_list.append({
+            "id": point_id,
+            "title": point_title,
+            "jobCount": job_count,
+            "has_finished": is_finished,
+            "need_unlock": need_unlock,
+        })
+
+    return point_list
+
+
+# ==================== 任务点卡片 ====================
+
+def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """解析任务点列表页面，提取任务点信息（仅保留 workid 测验任务）"""
+    logger.trace("开始解码任务点列表...")
+
+    if "章节未开放" in html_text:
+        return [], {"notOpen": True}
+
+    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
+    if not temp:
+        return [], {}
+
+    try:
+        cards_data = json.loads("{" + temp[0] + "}")
+    except json.JSONDecodeError:
+        return [], {}
+
+    if not cards_data:
+        return [], {}
+
+    job_info = _extract_job_info(cards_data)
+    cards = cards_data.get("attachments", [])
+    job_list = _process_attachment_cards(cards)
+
+    return job_list, job_info
+
+
+def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
+    """从卡片数据中提取任务基本信息"""
+    defaults = cards_data.get("defaults", {})
+    if not defaults:
+        return {}
+    return {
+        "ktoken": defaults.get("ktoken", ""),
+        "mtEnc": defaults.get("mtEnc", ""),
+        "defenc": defaults.get("defenc", ""),
+        "cardid": defaults.get("cardid", ""),
+        "cpi": defaults.get("cpi", ""),
+        "qnenc": defaults.get("qnenc", ""),
+        "knowledgeid": defaults.get("knowledgeid", ""),
+    }
+
+
+def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """处理附件任务卡片，抽题只关心 workid（测验/作业）任务"""
+    job_list = []
+    for card in cards:
+        if card.get("job") is None:
+            continue
+        if "otherInfo" in card:
+            card["otherInfo"] = card["otherInfo"].split("&")[0]
+        card_type = card.get("type", "").lower()
+        if card_type == "workid":
+            job_list.append(_process_work_task(card))
+    return job_list
+
+
+def _process_work_task(card: Dict[str, Any]) -> Dict[str, Any]:
+    """处理作业/测验类型任务"""
+    return {
+        "type": "workid",
+        "jobid": card.get("jobid", ""),
+        "otherinfo": card.get("otherInfo", ""),
+        "mid": card.get("mid", ""),
+        "enc": card.get("enc", ""),
+        "aid": card.get("aid", ""),
+        "title": card.get("property", {}).get("title", "章节测验"),
+    }
+
+
+# ==================== 题目解析（核心） ====================
+
+def decode_questions_info(html_content: str) -> Dict[str, Any]:
+    """
+    解析题目信息，提取表单数据和问题列表（含正确答案，若页面提供）。
+
+    返回字典中包含：
+      - questions: 题目列表，每题含 id/title/options/type/answer/analysis
+      - 以及若干表单隐藏字段（供提交时使用，本项目仅用于抽题展示）
+    """
+    soup = BeautifulSoup(html_content, "lxml")
+    form_data = _extract_form_data(soup)
+
+    has_font_encryption = bool(soup.find("style", id="cxSecretStyle"))
+    font_decoder = None
+    if has_font_encryption:
+        try:
+            font_decoder = FontDecoder(html_content)
+        except Exception as e:
+            logger.warning(f"字体解码器初始化失败: {e}")
+            font_decoder = None
+
+    questions = []
+    form = soup.find("form")
+    if form:
+        for div_tag in form.find_all("div", class_="singleQuesId"):
+            question = _process_question(div_tag, font_decoder)
+            if question:
+                questions.append(question)
+
+    form_data["questions"] = questions
+    form_data["answerwqbid"] = ",".join([q["id"] for q in questions]) + ","
+    return form_data
+
+
+def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
+    """从 BeautifulSoup 对象中提取表单隐藏字段"""
+    form_data: Dict[str, Any] = {}
+    form_tag = soup.find("form")
+    if not form_tag:
+        return form_data
+    for input_tag in form_tag.find_all("input"):
+        if "name" not in input_tag.attrs or "answer" in input_tag.attrs["name"]:
+            continue
+        form_data[input_tag.attrs["name"]] = input_tag.attrs.get("value", "")
+    return form_data
+
+
+def _process_question(div_tag, font_decoder=None) -> Optional[Dict[str, Any]]:
+    """处理单个问题，解析题干、选项、题型与正确答案。"""
+    question_id = div_tag.attrs.get("data", "")
+    timu = div_tag.find("div", class_="TiMu")
+    q_type_code = timu.attrs.get("data", "") if timu else ""
+    q_type = _get_question_type(q_type_code)
+
+    title_div = div_tag.find("div", class_="Zy_TItle")
+    options_list = div_tag.find("ul").find_all("li") if div_tag.find("ul") else []
+
+    q_title = _extract_title(title_div, font_decoder)
+    q_options = [_extract_choices(li, font_decoder) for li in options_list]
+    q_options = [o for o in q_options if o]
+    q_options.sort()
+
+    # 尝试解析正确答案与解析（自测/作业回顾页通常提供）
+    answer, analysis = _extract_answer_and_analysis(div_tag, font_decoder)
+
+    return {
+        "id": question_id,
+        "title": q_title,
+        "options": q_options,            # list[str]，每项形如 "A. xxx"
+        "type": q_type,
+        "type_code": q_type_code,
+        "answer": answer,                # str，正确答案（可能为空）
+        "analysis": analysis,            # str，答案解析（可能为空）
+    }
+
+
+def _get_question_type(type_code: str) -> str:
+    """根据题型代码返回题型名称"""
+    type_map = {
+        "0": "single",       # 单选题
+        "1": "multiple",     # 多选题
+        "2": "completion",   # 填空题
+        "3": "judgement",    # 判断题
+        "4": "shortanswer",  # 简答题
+    }
+    if type_code in type_map:
+        return type_map[type_code]
+    logger.debug(f"未知题型代码 -> {type_code}")
+    return "unknown"
+
+
+def _clean_text(raw: str) -> str:
+    return raw.replace("\r", "").replace("\t", "").replace("\xa0", " ").strip()
+
+
+def _extract_title(element, font_decoder=None) -> str:
+    """提取题干内容，支持图片占位与加密字体解码"""
+    if not element:
+        return ""
+    content = []
+    for item in element.descendants:
+        if isinstance(item, NavigableString):
+            content.append(item.string or "")
+        elif getattr(item, "name", None) == "img":
+            img_url = item.get("src", "")
+            if img_url:
+                content.append(f'【图片: {img_url}】')
+    raw_content = "".join(content)
+    cleaned = raw_content.replace("\r", "").replace("\t", "").replace("\n", "").strip()
+    # 去掉题型前缀，如 "（单选题）"
+    if font_decoder:
+        try:
+            return font_decoder.decode(cleaned)
+        except Exception:
+            return cleaned
+    return cleaned
+
+
+def _extract_choices(element, font_decoder=None) -> str:
+    """提取选项内容，支持加密字体解码"""
+    if not element:
+        return ""
+    choice = element.get("aria-label") or element.get_text()
+    if not choice:
+        return ""
+    cleaned = re.sub(r"[\r\t\n]", "", choice)
+    if font_decoder:
+        try:
+            cleaned = font_decoder.decode(cleaned)
+        except Exception:
+            pass
+    cleaned = cleaned.strip()
+    if cleaned.endswith("选择"):
+        cleaned = cleaned[:-2].rstrip()
+    return cleaned
+
+
+def _extract_answer_and_analysis(div_tag, font_decoder=None) -> Tuple[str, str]:
+    """
+    从题目 div 中尽力解析正确答案与解析。
+
+    超星不同页面结构差异较大，这里覆盖常见几种：
+      - 含 class 包含 'Cy_ulTk' / 'cyTk' 的答案块
+      - 文本中出现 "正确答案：X" / "我的答案" 等
+    解析不到时返回空字符串，由上层决定如何展示。
+    """
+    answer = ""
+    analysis = ""
+
+    # 1) 常见答案容器
+    for cls in ["Cy_ulTk", "Py_answer", "cyTk", "mark_answer", "Cy_ul"]:
+        block = div_tag.find("div", class_=cls)
+        if block:
+            text = _clean_text(block.get_text(separator=" "))
+            if text:
+                m = re.search(r"正确答案[：:]\s*([^\s。]+)", text)
+                if m:
+                    answer = m.group(1).strip()
+                ma = re.search(r"(答案解析|解析)[：:]\s*(.+)", text)
+                if ma:
+                    analysis = ma.group(2).strip()
+                if not answer and not analysis:
+                    analysis = text
+                break
+
+    # 2) 兜底：整块文本正则
+    if not answer:
+        whole = div_tag.get_text(separator=" ")
+        m = re.search(r"正确答案[：:]\s*([A-Za-z对错正确错误√×]+)", whole)
+        if m:
+            answer = m.group(1).strip()
+
+    if font_decoder and answer:
+        try:
+            answer = font_decoder.decode(answer)
+        except Exception:
+            pass
+    if font_decoder and analysis:
+        try:
+            analysis = font_decoder.decode(analysis)
+        except Exception:
+            pass
+
+    return answer, analysis

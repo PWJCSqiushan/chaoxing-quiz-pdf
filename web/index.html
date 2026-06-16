@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="format-detection" content="telephone=no" />
+<title>超星自测题库 · PDF 生成</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --primary:#3b6cf6; --primary-d:#2b55cc;
+    --text:#1f2430; --muted:#7b8294; --line:#e7eaf1; --ok:#1faa59; --err:#e0483b;
+    --radius:14px; --shadow:0 6px 22px rgba(31,57,120,.08);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:var(--bg); color:var(--text); font-size:15px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:560px; margin:0 auto; padding:16px 14px 60px;}
+  header.app{display:flex;align-items:center;gap:10px;padding:6px 2px 16px}
+  header.app .logo{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#5a85ff,#3b6cf6);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:18px}
+  header.app h1{font-size:17px;margin:0;font-weight:650}
+  header.app .sub{font-size:12px;color:var(--muted)}
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 16px;margin-bottom:14px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:650;display:flex;align-items:center;gap:8px}
+  .card h2 .step{width:22px;height:22px;border-radius:50%;background:var(--primary);color:#fff;font-size:12px;
+    display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  label.fld{display:block;margin-bottom:12px}
+  label.fld span{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+  input,select{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;font-size:15px;
+    background:#fbfcfe;color:var(--text);outline:none;transition:border .15s}
+  input:focus,select:focus{border-color:var(--primary);background:#fff}
+  .row{display:flex;gap:10px}
+  .row>*{flex:1}
+  button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:600;padding:12px 14px;
+    background:var(--primary);color:#fff;width:100%;transition:.15s;display:flex;align-items:center;justify-content:center;gap:6px}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  button.ghost{background:#eef2fb;color:var(--primary)}
+  button.sec{background:#fff;color:var(--text);border:1px solid var(--line)}
+  .tabs{display:flex;background:#eef1f8;border-radius:10px;padding:4px;margin-bottom:14px}
+  .tabs button{background:transparent;color:var(--muted);font-weight:600;padding:9px}
+  .tabs button.on{background:#fff;color:var(--primary);box-shadow:0 2px 6px rgba(0,0,0,.06)}
+  .muted{color:var(--muted);font-size:13px}
+  .hint{font-size:12px;color:var(--muted);margin-top:-6px;margin-bottom:10px}
+  .list{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  .list .it{padding:11px 13px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;cursor:pointer}
+  .list .it:last-child{border-bottom:none}
+  .list .it.on{background:#eef4ff}
+  .list .it .t{flex:1;font-size:14px}
+  .list .it .m{font-size:12px;color:var(--muted)}
+  .badge{display:inline-block;font-size:12px;color:var(--ok);background:#e8f7ee;padding:2px 8px;border-radius:20px}
+  .toast{position:fixed;left:50%;top:24px;transform:translateX(-50%);background:#222b3a;color:#fff;padding:10px 16px;
+    border-radius:10px;font-size:14px;z-index:99;opacity:0;transition:.25s;pointer-events:none;max-width:90%}
+  .toast.show{opacity:1}
+  .log{background:#0f1626;color:#9fe3b0;font-size:12px;border-radius:10px;padding:10px;height:150px;overflow:auto;
+    font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;line-height:1.45}
+  .progress{height:6px;background:#eef1f8;border-radius:6px;overflow:hidden;margin:10px 0}
+  .progress>i{display:block;height:100%;width:30%;background:linear-gradient(90deg,#5a85ff,#3b6cf6);border-radius:6px;
+    animation:slide 1.1s infinite ease-in-out}
+  @keyframes slide{0%{margin-left:-30%}100%{margin-left:100%}}
+  .center{text-align:center}
+  .sp{height:8px}
+  .switch{display:flex;align-items:center;justify-content:space-between;padding:10px 0}
+  .switch small{color:var(--muted);display:block;font-size:12px}
+  .tg{position:relative;width:46px;height:26px;background:#cdd4e2;border-radius:20px;transition:.2s;flex:0 0 auto}
+  .tg.on{background:var(--primary)}
+  .tg::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;background:#fff;border-radius:50%;transition:.2s}
+  .tg.on::after{left:23px}
+  .done-actions button{margin-bottom:10px}
+  a.link{color:var(--primary);text-decoration:none}
+  .hide{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="app">
+    <div class="logo">题</div>
+    <div>
+      <h1>超星自测题库 · PDF</h1>
+      <div class="sub">抓取题库 · 生成可打印试卷</div>
+    </div>
+  </header>
+
+  <!-- ===== 登录页 ===== -->
+  <section id="view-auth">
+    <div class="tabs">
+      <button id="tab-login" class="on" onclick="switchAuth('login')">登录</button>
+      <button id="tab-reg" onclick="switchAuth('reg')">注册</button>
+    </div>
+    <div class="card">
+      <h2 id="auth-title"><span class="step">①</span>本地账号</h2>
+      <label class="fld"><span>用户名（≥3位）</span><input id="u-name" autocomplete="username" placeholder="用于登录本程序"/></label>
+      <label class="fld"><span>密码（≥6位）</span><input id="u-pass" type="password" autocomplete="current-password" placeholder="本程序登录密码"/></label>
+      <label class="fld hide" id="u-confirm-wrap"><span>确认密码</span><input id="u-confirm" type="password" placeholder="再次输入密码"/></label>
+      <button id="auth-btn" onclick="doAuth()">登 录</button>
+      <p class="hint center" style="margin-top:12px">本地账号仅用于保存你的设置与超星凭证，数据存于服务器本地。</p>
+    </div>
+  </section>
+
+  <!-- ===== 主应用 ===== -->
+  <section id="view-app" class="hide">
+    <!-- 超星登录 -->
+    <div class="card" id="card-cx">
+      <h2><span class="step">②</span>超星账号 <span id="cx-status"></span></h2>
+      <div id="cx-form">
+        <label class="fld"><span>超星手机号</span><input id="cx-phone" inputmode="numeric" placeholder="登录学习通的手机号"/></label>
+        <label class="fld"><span>超星密码</span><input id="cx-pass" type="password" placeholder="学习通登录密码"/></label>
+        <div class="switch">
+          <div><b style="font-size:14px">记住超星账号</b><small>下次免输密码</small></div>
+          <div id="cx-remember" class="tg on" onclick="this.classList.toggle('on')"></div>
+        </div>
+        <button onclick="cxLogin()">登录超星</button>
+      </div>
+      <div id="cx-done" class="hide">
+        <p class="muted">✅ 超星账号已登录，可以选择课程开始抓题。</p>
+        <button class="sec" onclick="logoutAll()">退出登录</button>
+      </div>
+    </div>
+
+    <!-- 课程与抓题配置 -->
+    <div class="card hide" id="card-fetch">
+      <h2><span class="step">③</span>选择课程与抓题模式</h2>
+      <button class="ghost" id="load-courses" onclick="loadCourses()">📚 加载我的课程</button>
+      <div class="sp"></div>
+      <div id="courses" class="list hide"></div>
+
+      <div id="mode-area" class="hide">
+        <div class="sp"></div>
+        <div class="tabs">
+          <button id="m-acc" class="on" onclick="switchMode('accumulate')">反复抽题汇总</button>
+          <button id="m-single" onclick="switchMode('single')">单章节测验</button>
+        </div>
+
+        <div id="cfg-acc">
+          <p class="hint">系统会对整门课程的测验反复抽题、自动去重累积，逐步逼近完整题库。</p>
+          <div class="row">
+            <label class="fld"><span>抓取轮数</span>
+              <select id="rounds"><option>2</option><option selected>3</option><option>5</option><option>8</option></select></label>
+            <label class="fld"><span>并发数</span>
+              <select id="concurrency"><option>2</option><option selected>3</option><option>5</option></select></label>
+          </div>
+          <label class="fld"><span>目标题量（0 = 不限，抓到无新增为止）</span><input id="target" inputmode="numeric" value="0"/></label>
+        </div>
+
+        <div id="cfg-single" class="hide">
+          <p class="hint">仅抓取所选章节内的测验题目。</p>
+          <button class="ghost" onclick="loadChapters()">加载该课程章节</button>
+          <div class="sp"></div>
+          <div id="chapters" class="list hide"></div>
+        </div>
+
+        <div class="sp"></div>
+        <label class="fld"><span>试卷标题</span><input id="paper-title" placeholder="留空自动用课程名"/></label>
+        <div class="switch">
+          <div><b style="font-size:14px">附参考答案与解析</b><small>放在试卷末尾，不影响作答</small></div>
+          <div id="inc-ans" class="tg on" onclick="this.classList.toggle('on')"></div>
+        </div>
+        <div class="sp"></div>
+        <button id="start-btn" onclick="startFetch()">🚀 开始抓题并生成 PDF</button>
+      </div>
+    </div>
+
+    <!-- 进度 -->
+    <div class="card hide" id="card-progress">
+      <h2><span class="step">④</span>抓题进度</h2>
+      <div class="progress" id="pbar"><i></i></div>
+      <p id="prog-msg" class="muted">准备中…</p>
+      <div class="log" id="log"></div>
+    </div>
+
+    <!-- 结果 -->
+    <div class="card hide" id="card-result">
+      <h2><span class="step">✓</span>试卷已生成</h2>
+      <p class="center" style="font-size:16px;margin:6px 0 16px">共 <b id="r-count" style="color:var(--primary)">0</b> 题</p>
+      <div class="done-actions">
+        <button onclick="openPdf()">📖 在线打开 / 预览 PDF</button>
+        <button class="ghost" onclick="downloadPdf()">⬇️ 下载到本地（选择位置）</button>
+        <button class="sec" onclick="resetFetch()">↻ 再抓一份</button>
+      </div>
+      <p class="hint center" style="margin-top:12px" id="wx-tip">
+        微信/QQ 中：点"在线打开"后，再点右上角「···」→「在浏览器打开」或「用其他应用打开」即可保存或转发。
+      </p>
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = ""; // 同源
+let state = { course:null, point:null, mode:"accumulate", taskId:null, pdfName:null };
+
+function toast(msg, ok){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.style.background= ok===false ? '#e0483b' : '#222b3a';
+  t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2200);
+}
+async function api(path, opts={}){
+  opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+  opts.credentials='include';
+  const r = await fetch(API+path, opts);
+  let j; try{ j= await r.json(); }catch{ j={status:false,msg:'网络错误'}; }
+  if(r.status===401){ showAuth(); throw new Error('未登录'); }
+  return j;
+}
+
+/* ---------- 认证 ---------- */
+let authMode='login';
+function switchAuth(m){
+  authMode=m;
+  document.getElementById('tab-login').classList.toggle('on',m==='login');
+  document.getElementById('tab-reg').classList.toggle('on',m==='reg');
+  document.getElementById('u-confirm-wrap').classList.toggle('hide',m==='login');
+  document.getElementById('auth-btn').textContent= m==='login'?'登 录':'注 册';
+  document.getElementById('auth-title').innerHTML='<span class="step">①</span>'+(m==='login'?'本地账号登录':'注册本地账号');
+}
+async function doAuth(){
+  const username=document.getElementById('u-name').value.trim();
+  const password=document.getElementById('u-pass').value;
+  if(authMode==='reg'){
+    const confirm_password=document.getElementById('u-confirm').value;
+    const j=await api('/api/register',{method:'POST',body:JSON.stringify({username,password,confirm_password})});
+    if(!j.status) return toast(j.msg,false);
+    toast('注册成功，正在登录…');
+  }
+  const j=await api('/api/login',{method:'POST',body:JSON.stringify({username,password})});
+  if(!j.status) return toast(j.msg,false);
+  enterApp();
+}
+function showAuth(){ document.getElementById('view-auth').classList.remove('hide'); document.getElementById('view-app').classList.add('hide'); }
+function enterApp(){
+  document.getElementById('view-auth').classList.add('hide');
+  document.getElementById('view-app').classList.remove('hide');
+  refreshMe();
+}
+async function refreshMe(){
+  const j=await api('/api/me');
+  if(j.status && j.data.cx_logged_in){ markCxDone(); }
+}
+async function logoutAll(){ await api('/api/logout',{method:'POST'}); location.reload(); }
+
+/* ---------- 超星登录 ---------- */
+async function cxLogin(){
+  const phone=document.getElementById('cx-phone').value.trim();
+  const password=document.getElementById('cx-pass').value;
+  const remember=document.getElementById('cx-remember').classList.contains('on');
+  if(!phone||!password) return toast('请输入超星手机号和密码',false);
+  toast('正在登录超星…');
+  const j=await api('/api/cx/login',{method:'POST',body:JSON.stringify({phone,password,remember})});
+  if(!j.status) return toast(j.msg,false);
+  toast('超星登录成功'); markCxDone();
+}
+function markCxDone(){
+  document.getElementById('cx-form').classList.add('hide');
+  document.getElementById('cx-done').classList.remove('hide');
+  document.getElementById('cx-status').innerHTML='<span class="badge">已登录</span>';
+  document.getElementById('card-fetch').classList.remove('hide');
+}
+
+/* ---------- 课程 / 章节 ---------- */
+async function loadCourses(){
+  const btn=document.getElementById('load-courses'); btn.disabled=true; btn.textContent='加载中…';
+  const j=await api('/api/courses');
+  btn.disabled=false; btn.textContent='📚 重新加载课程';
+  if(!j.status) return toast(j.msg,false);
+  const box=document.getElementById('courses'); box.innerHTML=''; box.classList.remove('hide');
+  if(!j.data.length){ box.innerHTML='<div class="it"><span class="t muted">没有找到课程</span></div>'; return; }
+  j.data.forEach(c=>{
+    const d=document.createElement('div'); d.className='it';
+    d.innerHTML=`<span class="t">${esc(c.title)}</span><span class="m">${esc(c.teacher||'')}</span>`;
+    d.onclick=()=>{ state.course=c; [...box.children].forEach(x=>x.classList.remove('on')); d.classList.add('on');
+      document.getElementById('mode-area').classList.remove('hide'); document.getElementById('chapters').classList.add('hide'); };
+    box.appendChild(d);
+  });
+}
+async function loadChapters(){
+  if(!state.course) return toast('请先选择课程',false);
+  const j=await api('/api/chapters',{method:'POST',body:JSON.stringify(state.course)});
+  if(!j.status) return toast(j.msg,false);
+  const box=document.getElementById('chapters'); box.innerHTML=''; box.classList.remove('hide');
+  j.data.forEach(p=>{
+    const d=document.createElement('div'); d.className='it';
+    d.innerHTML=`<span class="t">${esc(p.title)}</span>`;
+    d.onclick=()=>{ state.point=p; [...box.children].forEach(x=>x.classList.remove('on')); d.classList.add('on'); };
+    box.appendChild(d);
+  });
+}
+function switchMode(m){
+  state.mode=m;
+  document.getElementById('m-acc').classList.toggle('on',m==='accumulate');
+  document.getElementById('m-single').classList.toggle('on',m==='single');
+  document.getElementById('cfg-acc').classList.toggle('hide',m!=='accumulate');
+  document.getElementById('cfg-single').classList.toggle('hide',m!=='single');
+}
+
+/* ---------- 抓题 ---------- */
+async function startFetch(){
+  if(!state.course) return toast('请先选择课程',false);
+  if(state.mode==='single' && !state.point) return toast('请先选择章节',false);
+  const payload={
+    course: state.course, mode: state.mode,
+    rounds: +document.getElementById('rounds').value,
+    concurrency: +document.getElementById('concurrency').value,
+    target: +document.getElementById('target').value||0,
+    title: document.getElementById('paper-title').value.trim(),
+    include_answers: document.getElementById('inc-ans').classList.contains('on'),
+  };
+  if(state.mode==='single') payload.point=state.point;
+
+  document.getElementById('start-btn').disabled=true;
+  document.getElementById('card-progress').classList.remove('hide');
+  document.getElementById('card-result').classList.add('hide');
+  document.getElementById('log').innerHTML='';
+  document.getElementById('pbar').classList.remove('hide');
+
+  const j=await api('/api/fetch',{method:'POST',body:JSON.stringify(payload)});
+  if(!j.status){ document.getElementById('start-btn').disabled=false; return toast(j.msg,false); }
+  state.taskId=j.data.task_id;
+  pollTask();
+}
+async function pollTask(){
+  const logBox=document.getElementById('log');
+  const j=await api('/api/task/'+state.taskId);
+  if(!j.status){ return toast(j.msg,false); }
+  document.getElementById('prog-msg').textContent=j.data.message||'处理中…';
+  logBox.textContent=(j.data.logs||[]).join('\n'); logBox.scrollTop=logBox.scrollHeight;
+  if(j.data.status==='running'){ setTimeout(pollTask,1200); return; }
+  document.getElementById('pbar').classList.add('hide');
+  document.getElementById('start-btn').disabled=false;
+  if(j.data.status==='failed'){ toast(j.data.message,false); return; }
+  // done
+  state.pdfName=j.data.pdf;
+  document.getElementById('r-count').textContent=j.data.count;
+  document.getElementById('card-result').classList.remove('hide');
+  document.getElementById('card-result').scrollIntoView({behavior:'smooth'});
+}
+function pdfUrl(download){
+  const name=encodeURIComponent((document.getElementById('paper-title').value.trim()|| (state.course&&state.course.title) ||'超星自测试卷'));
+  return `/api/task/${state.taskId}/pdf?name=${name}`+(download?'&download=1':'');
+}
+function openPdf(){ window.open(pdfUrl(false),'_blank'); }
+function downloadPdf(){
+  // 桌面浏览器触发下载；移动端浏览器同样会进入下载/预览
+  const a=document.createElement('a'); a.href=pdfUrl(true); a.download=''; document.body.appendChild(a); a.click(); a.remove();
+}
+function resetFetch(){
+  document.getElementById('card-progress').classList.add('hide');
+  document.getElementById('card-result').classList.add('hide');
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* ---------- 启动 ---------- */
+(async function(){
+  try{ const j=await fetch('/api/me',{credentials:'include'}).then(r=>r.json());
+    if(j.status){ enterApp(); } else showAuth();
+  }catch{ showAuth(); }
+})();
+</script>
+</body>
+</html>
