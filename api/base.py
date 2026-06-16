@@ -458,7 +458,7 @@ class Chaoxing:
         """
         取答题页所需的 enc：
         GET /exam/test/getIdentifyCode?id=<tId>&inpCode=&classId=&courseId=&mooc2=1
-        返回 {status, enc}（jsonp，可能带 callback 包裹）。
+        返回 JSONP / JS 对象字面量（键可能未加引号），用正则提取 enc。
         """
         try:
             resp = self.session.get(
@@ -471,14 +471,22 @@ class Chaoxing:
                     "mooc2": 1,
                     "_": get_timestamp(),
                 },
+                headers={"Referer": f"{self.EXAM_HOST}/mooc2/exam/exam-list"},
             )
             text = (resp.text or "").strip()
-            m = re.search(r"\{.*\}", text, re.S)
-            if m:
-                data = json.loads(m.group(0))
+            logger.debug(f"getIdentifyCode 原始响应: {text[:300]}")
+            # 优先严格 JSON
+            try:
+                data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
                 if data.get("enc"):
                     return data["enc"]
-                logger.debug(f"getIdentifyCode 无 enc: {text[:200]}")
+            except Exception:
+                pass
+            # 回退：正则提取 enc（兼容未加引号 / 单引号的 JS 字面量）
+            m = re.search(r"""enc['"]?\s*:\s*['"]([0-9a-zA-Z]+)['"]""", text)
+            if m:
+                return m.group(1)
+            logger.warning(f"getIdentifyCode 未提取到 enc，响应: {text[:200]}")
         except Exception as e:
             logger.debug(f"getIdentifyCode 失败: {e}")
         return ""
@@ -512,11 +520,16 @@ class Chaoxing:
         last_html = None
         for url, params in candidates:
             try:
-                resp = self.session.get(url, params=params)
+                referer = (
+                    f"{self.EXAM_HOST}/exam/test/examcode/examnotes"
+                    f"?courseId={course['courseId']}&classId={course['clazzId']}"
+                    f"&examId={entry['tId']}&cpi={course['cpi']}"
+                )
+                resp = self.session.get(url, params=params, headers={"Referer": referer})
                 if resp.status_code == 200 and resp.text:
                     if any(k in resp.text for k in ("singleQuesId", "TiMu", "questionLi", "Cy_ulTk")):
                         return resp.text
-                    if "无权限" not in resp.text:
+                    if "无权限" not in resp.text and "3004" not in resp.text:
                         last_html = resp.text
             except requests.RequestException as e:
                 logger.debug(f"取卷请求失败 {url}: {e}")
