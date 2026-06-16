@@ -6,6 +6,7 @@
 以支持 Web 服务下的多用户并发，互不串号。
 """
 import functools
+import json
 import random
 import re
 import threading
@@ -453,42 +454,70 @@ class Chaoxing:
             pass
         return None
 
+    def _get_start_enc(self, course: Dict, entry: Dict) -> str:
+        """
+        取答题页所需的 enc：
+        GET /exam/test/getIdentifyCode?id=<tId>&inpCode=&classId=&courseId=&mooc2=1
+        返回 {status, enc}（jsonp，可能带 callback 包裹）。
+        """
+        try:
+            resp = self.session.get(
+                f"{self.EXAM_HOST}/exam/test/getIdentifyCode",
+                params={
+                    "id": entry["tId"],
+                    "inpCode": "",
+                    "classId": course["clazzId"],
+                    "courseId": course["courseId"],
+                    "mooc2": 1,
+                    "_": get_timestamp(),
+                },
+            )
+            text = (resp.text or "").strip()
+            m = re.search(r"\{.*\}", text, re.S)
+            if m:
+                data = json.loads(m.group(0))
+                if data.get("enc"):
+                    return data["enc"]
+                logger.debug(f"getIdentifyCode 无 enc: {text[:200]}")
+        except Exception as e:
+            logger.debug(f"getIdentifyCode 失败: {e}")
+        return ""
+
     def fetch_paper_html(self, course: Dict, entry: Dict, meta: Dict) -> Optional[str]:
-        """获取整卷题目 HTML：先试 lookPaper 预览，再试 reVersionTestStartNew 答题页。"""
+        """
+        取整卷题目 HTML：
+          1) getIdentifyCode 拿答题 enc
+          2) reVersionTestStartNew 打开答题页（含题目）
+          3) 兜底再试 lookPaper 预览
+        """
         openc = meta.get("openc", "")
-        # 1) lookPaper 预览（只读）
-        look_params = {
-            "courseId": course["courseId"],
-            "classId": course["clazzId"],
-            "paperId": entry["paperId"],
-            "p": 1,
-            "ut": "s",
-            "cpi": course["cpi"],
-            "examRelationId": entry["tId"],
-            "enc": entry.get("enc", ""),
-            "newMooc": "true",
-            "openc": openc,
-            "isPreview": "true",
-        }
-        last_html = None
-        for url, params in (
-            (f"{self.EXAM_HOST}/exam/lookPaper", look_params),
-            (f"{self.EXAM_HOST}/exam/test/reVersionTestStartNew", {
+        start_enc = self._get_start_enc(course, entry)
+
+        candidates = []
+        if start_enc:
+            candidates.append((f"{self.EXAM_HOST}/exam/test/reVersionTestStartNew", {
                 "courseId": course["courseId"], "classId": course["clazzId"],
                 "tId": entry["tId"], "id": entry["relationId"], "p": 1, "tag": 1,
-                "enc": entry.get("enc", ""), "cpi": course["cpi"],
+                "enc": start_enc, "cpi": course["cpi"],
                 "openc": openc, "newMooc": "true",
-            }),
-        ):
+            }))
+        # 兜底：lookPaper 预览（部分情况可用）
+        candidates.append((f"{self.EXAM_HOST}/exam/lookPaper", {
+            "courseId": course["courseId"], "classId": course["clazzId"],
+            "paperId": entry["paperId"], "p": 1, "ut": "s", "cpi": course["cpi"],
+            "examRelationId": entry["tId"], "enc": entry.get("enc", ""),
+            "newMooc": "true", "openc": openc, "isPreview": "true",
+        }))
+
+        last_html = None
+        for url, params in candidates:
             try:
                 resp = self.session.get(url, params=params)
-                if resp.status_code == 200 and resp.text and (
-                    "singleQuesId" in resp.text or "TiMu" in resp.text or "questionLi" in resp.text
-                ):
-                    return resp.text
-                # 即使没命中关键字，也保留最后一次响应作为兜底
-                if resp.status_code == 200:
-                    last_html = resp.text
+                if resp.status_code == 200 and resp.text:
+                    if any(k in resp.text for k in ("singleQuesId", "TiMu", "questionLi", "Cy_ulTk")):
+                        return resp.text
+                    if "无权限" not in resp.text:
+                        last_html = resp.text
             except requests.RequestException as e:
                 logger.debug(f"取卷请求失败 {url}: {e}")
         return last_html
