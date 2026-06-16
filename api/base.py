@@ -13,6 +13,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 
 from api.cipher import AESCipher
@@ -391,37 +392,65 @@ class Chaoxing:
         return entries
 
     def get_selftest_meta(self, course: Dict) -> Dict:
-        """获取自测所需的课程参数（openc 等）。"""
+        """获取自测所需的课程参数（enc / examEnc / openc 等）。"""
         meta = self.get_course_meta(course)
-        if not meta.get("openc"):
-            # 从 exam-list 页兜底取 openc
+        if not (meta.get("openc") and meta.get("examEnc")):
+            # 从 exam-list 页兜底取
             try:
                 resp = self.session.get(
                     f"{self.EXAM_HOST}/mooc2/exam/exam-list",
-                    params={"courseId": course["courseId"], "classId": course["clazzId"],
+                    params={"courseid": course["courseId"], "clazzid": course["clazzId"],
                             "cpi": course["cpi"], "ut": "s"},
                 )
                 soup = BeautifulSoup(resp.text, "lxml")
-                el = soup.find("input", id="openc")
-                if el and el.get("value"):
-                    meta["openc"] = el["value"]
+                for k in ("openc", "examEnc", "enc"):
+                    el = soup.find("input", id=k)
+                    if el and el.get("value") and not meta.get(k):
+                        meta[k] = el["value"]
             except Exception as e:
-                logger.debug(f"取 openc 失败: {e}")
+                logger.debug(f"取 exam meta 失败: {e}")
         return meta
 
-    def find_paper_entry(self, course: Dict, paper_id: int) -> Optional[Dict]:
-        """在 exam-list 中找到指定 paperId 对应的入口（tId/relationId/enc）。"""
+    def _fetch_exam_list_html(self, course: Dict, meta: Dict) -> str:
+        """按真实参数请求自测列表页 exam-list，返回 HTML。"""
+        params = {
+            "courseid": course["courseId"],
+            "clazzid": course["clazzId"],
+            "cpi": course["cpi"],
+            "ut": "s",
+            "t": get_timestamp(),
+            "enc": meta.get("examEnc", ""),
+            "openc": meta.get("openc", ""),
+            "type": 1,
+            "stuenc": meta.get("enc", ""),
+        }
         try:
             resp = self.session.get(
-                f"{self.EXAM_HOST}/mooc2/exam/exam-list",
-                params={"courseId": course["courseId"], "classId": course["clazzId"],
-                        "cpi": course["cpi"], "ut": "s"},
+                f"{self.EXAM_HOST}/mooc2/exam/exam-list", params=params
             )
-            for e in self._parse_exam_list_entries(resp.text):
-                if str(e["paperId"]) == str(paper_id):
-                    return e
-        except Exception as e:
-            logger.debug(f"查找自测卷入口失败: {e}")
+            return resp.text or ""
+        except requests.RequestException as e:
+            logger.debug(f"请求 exam-list 失败: {e}")
+            return ""
+
+    def find_paper_entry(self, course: Dict, paper_id: int, meta: Dict) -> Optional[Dict]:
+        """在 exam-list 中找到指定 paperId 对应的入口（tId/relationId/enc）。"""
+        html = self._fetch_exam_list_html(course, meta)
+        entries = self._parse_exam_list_entries(html)
+        logger.info(f"exam-list 解析到 {len(entries)} 个自测卷入口")
+        for e in entries:
+            if str(e["paperId"]) == str(paper_id):
+                return e
+        # 没找到：保存列表 HTML 便于排查
+        try:
+            import os
+            d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "debug_examlist.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.warning(f"未匹配 paperId={paper_id}；已保存 exam-list HTML（{len(html)} 字符）到 output/debug_examlist.html")
+        except Exception:
+            pass
         return None
 
     def fetch_paper_html(self, course: Dict, entry: Dict, meta: Dict) -> Optional[str]:
@@ -472,16 +501,21 @@ class Chaoxing:
         """
         task_id = self.create_selftest(course, meta, count=count)
         if not task_id:
+            logger.warning("create_selftest 失败")
             return None
+        logger.info(f"已新建自测，taskId={task_id}")
         paper_id = self.poll_selftest_paper(course, task_id)
         if not paper_id:
+            logger.warning("组卷未完成/失败")
             return None
-        entry = self.find_paper_entry(course, paper_id)
+        logger.info(f"组卷完成，paperId={paper_id}")
+        entry = self.find_paper_entry(course, paper_id, meta)
         if not entry:
-            logger.warning(f"未在自测列表找到 paperId={paper_id} 的入口")
             return None
+        logger.info(f"定位入口: tId={entry['tId']} relationId={entry['relationId']}")
         html = self.fetch_paper_html(course, entry, meta)
         if not html:
+            logger.warning("取卷 HTML 为空")
             return None
         parsed = decode_questions_info(html)
         parsed["_raw_html"] = html
