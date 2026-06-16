@@ -225,6 +225,15 @@ def _run_fetch_task(task_id: str, uid: int, payload: dict):
                 concurrency=int(payload.get("concurrency", 3)),
                 target=int(payload.get("target", 0)),
             )
+        elif mode == "browser":  # 浏览器半自动（过验证码）
+            from browser_fetcher import BrowserGrabber
+            grabber = BrowserGrabber(cx, progress_cb=progress, headless=False)
+            questions = grabber.grab(
+                course,
+                count=int(payload.get("count", 50)),
+                papers=int(payload.get("rounds", 5)),
+                target=int(payload.get("target", 0)),
+            )
         else:  # selftest（默认）：从“自测”功能随机抽题
             questions = fetcher.fetch_selftest(
                 course,

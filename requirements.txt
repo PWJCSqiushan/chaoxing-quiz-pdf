@@ -8,3 +8,7 @@ flask-cors>=5.0.0
 fpdf2>=2.8.0
 loguru>=0.7.0
 tqdm>=4.66.0
+
+# 浏览器半自动抓题（绕过自测滑块验证码）需要：
+#   pip install playwright  &&  python -m playwright install chromium
+playwright>=1.40.0

@@ -131,19 +131,24 @@
       <div id="mode-area" class="hide">
         <div class="sp"></div>
         <div class="tabs">
-          <button id="m-self" class="on" onclick="switchMode('selftest')">自测抽题</button>
+          <button id="m-browser" class="on" onclick="switchMode('browser')">浏览器半自动</button>
+          <button id="m-self" onclick="switchMode('selftest')">自测(纯后台)</button>
           <button id="m-chap" onclick="switchMode('chapter')">章节测验</button>
         </div>
 
-        <div id="cfg-self">
-          <p class="hint">使用超星「自测」功能从课程题库随机抽题，反复新建自测卷并自动去重累积，逼近完整题库。</p>
+        <div id="cfg-browser">
+          <p class="hint">推荐。程序自动新建自测卷，并在弹出的浏览器里打开答题页；遇到拖拽拼图验证码时由你手动拖一下，其余抓题去重全自动。可绕过超星反爬。</p>
           <div class="row">
             <label class="fld"><span>每份抽题数</span>
               <select id="count"><option>20</option><option selected>50</option><option>80</option><option>100</option></select></label>
             <label class="fld"><span>新建份数</span>
-              <select id="rounds"><option>3</option><option selected>5</option><option>8</option><option>12</option></select></label>
+              <select id="rounds"><option>2</option><option selected>3</option><option>5</option><option>8</option></select></label>
           </div>
           <label class="fld"><span>目标题量（0 = 不限，抓到无新增为止）</span><input id="target" inputmode="numeric" value="0"/></label>
+        </div>
+
+        <div id="cfg-self" class="hide">
+          <p class="hint">纯后台直接抓自测题库——但超星对自测答题页有滑块验证码，通常会被拦，建议用「浏览器半自动」。</p>
         </div>
 
         <div id="cfg-chap" class="hide">
@@ -213,7 +218,7 @@
 
 <script>
 const API = ""; // 同源
-let state = { course:null, point:null, mode:"selftest", taskId:null, pdfName:null, aiPresets:{} };
+let state = { course:null, point:null, mode:"browser", taskId:null, pdfName:null, aiPresets:{} };
 
 function toast(msg, ok){
   const t=document.getElementById('toast');
@@ -313,8 +318,10 @@ async function loadChapters(){
 }
 function switchMode(m){
   state.mode=m;
+  document.getElementById('m-browser').classList.toggle('on',m==='browser');
   document.getElementById('m-self').classList.toggle('on',m==='selftest');
   document.getElementById('m-chap').classList.toggle('on',m==='chapter');
+  document.getElementById('cfg-browser').classList.toggle('hide',m!=='browser');
   document.getElementById('cfg-self').classList.toggle('hide',m!=='selftest');
   document.getElementById('cfg-chap').classList.toggle('hide',m!=='chapter');
 }
