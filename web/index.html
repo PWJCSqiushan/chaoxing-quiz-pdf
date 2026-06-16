@@ -131,26 +131,47 @@
       <div id="mode-area" class="hide">
         <div class="sp"></div>
         <div class="tabs">
-          <button id="m-acc" class="on" onclick="switchMode('accumulate')">反复抽题汇总</button>
-          <button id="m-single" onclick="switchMode('single')">单章节测验</button>
+          <button id="m-self" class="on" onclick="switchMode('selftest')">自测抽题</button>
+          <button id="m-chap" onclick="switchMode('chapter')">章节测验</button>
         </div>
 
-        <div id="cfg-acc">
-          <p class="hint">系统会对整门课程的测验反复抽题、自动去重累积，逐步逼近完整题库。</p>
+        <div id="cfg-self">
+          <p class="hint">使用超星「自测」功能从课程题库随机抽题，反复新建自测卷并自动去重累积，逼近完整题库。</p>
           <div class="row">
-            <label class="fld"><span>抓取轮数</span>
-              <select id="rounds"><option>2</option><option selected>3</option><option>5</option><option>8</option></select></label>
-            <label class="fld"><span>并发数</span>
-              <select id="concurrency"><option>2</option><option selected>3</option><option>5</option></select></label>
+            <label class="fld"><span>每份抽题数</span>
+              <select id="count"><option>20</option><option selected>50</option><option>80</option><option>100</option></select></label>
+            <label class="fld"><span>新建份数</span>
+              <select id="rounds"><option>3</option><option selected>5</option><option>8</option><option>12</option></select></label>
           </div>
           <label class="fld"><span>目标题量（0 = 不限，抓到无新增为止）</span><input id="target" inputmode="numeric" value="0"/></label>
         </div>
 
-        <div id="cfg-single" class="hide">
-          <p class="hint">仅抓取所选章节内的测验题目。</p>
-          <button class="ghost" onclick="loadChapters()">加载该课程章节</button>
-          <div class="sp"></div>
-          <div id="chapters" class="list hide"></div>
+        <div id="cfg-chap" class="hide">
+          <p class="hint">遍历课程章节内的测验任务反复抓取去重（备用方式）。</p>
+          <div class="row">
+            <label class="fld"><span>抓取轮数</span>
+              <select id="rounds2"><option>2</option><option selected>3</option><option>5</option></select></label>
+            <label class="fld"><span>并发数</span>
+              <select id="concurrency"><option>2</option><option selected>3</option><option>5</option></select></label>
+          </div>
+        </div>
+
+        <!-- AI 解析配置 -->
+        <div class="sp"></div>
+        <div class="switch">
+          <div><b style="font-size:14px">AI 生成解析</b><small>为缺少解析的题目自动补全解析</small></div>
+          <div id="ai-on" class="tg" onclick="toggleAI()"></div>
+        </div>
+        <div id="ai-panel" class="hide" style="background:#f7f9fe;border-radius:10px;padding:12px;margin-top:4px">
+          <label class="fld"><span>接口预设</span>
+            <select id="ai-preset" onchange="applyPreset()"></select></label>
+          <div class="row">
+            <label class="fld"><span>Base URL</span><input id="ai-url" placeholder="https://api.deepseek.com/v1"/></label>
+            <label class="fld"><span>模型</span><input id="ai-model" placeholder="deepseek-chat"/></label>
+          </div>
+          <label class="fld"><span>API Key</span><input id="ai-key" type="password" placeholder="sk-..."/></label>
+          <button class="sec" onclick="testAI()">🔌 测试连接</button>
+          <p class="hint" id="ai-test-msg" style="margin-top:8px"></p>
         </div>
 
         <div class="sp"></div>
@@ -192,7 +213,7 @@
 
 <script>
 const API = ""; // 同源
-let state = { course:null, point:null, mode:"accumulate", taskId:null, pdfName:null };
+let state = { course:null, point:null, mode:"selftest", taskId:null, pdfName:null, aiPresets:{} };
 
 function toast(msg, ok){
   const t=document.getElementById('toast');
@@ -259,6 +280,7 @@ function markCxDone(){
   document.getElementById('cx-done').classList.remove('hide');
   document.getElementById('cx-status').innerHTML='<span class="badge">已登录</span>';
   document.getElementById('card-fetch').classList.remove('hide');
+  loadAIPresets();
 }
 
 /* ---------- 课程 / 章节 ---------- */
@@ -291,25 +313,70 @@ async function loadChapters(){
 }
 function switchMode(m){
   state.mode=m;
-  document.getElementById('m-acc').classList.toggle('on',m==='accumulate');
-  document.getElementById('m-single').classList.toggle('on',m==='single');
-  document.getElementById('cfg-acc').classList.toggle('hide',m!=='accumulate');
-  document.getElementById('cfg-single').classList.toggle('hide',m!=='single');
+  document.getElementById('m-self').classList.toggle('on',m==='selftest');
+  document.getElementById('m-chap').classList.toggle('on',m==='chapter');
+  document.getElementById('cfg-self').classList.toggle('hide',m!=='selftest');
+  document.getElementById('cfg-chap').classList.toggle('hide',m!=='chapter');
+}
+
+/* ---------- AI 解析配置 ---------- */
+async function loadAIPresets(){
+  try{
+    const j=await api('/api/ai/presets');
+    if(!j.status) return;
+    state.aiPresets=j.data;
+    const sel=document.getElementById('ai-preset'); sel.innerHTML='';
+    Object.entries(j.data).forEach(([k,v])=>{
+      const o=document.createElement('option'); o.value=k; o.textContent=v.label; sel.appendChild(o);
+    });
+    const o=document.createElement('option'); o.value='custom'; o.textContent='自定义'; sel.appendChild(o);
+    applyPreset();
+  }catch{}
+}
+function applyPreset(){
+  const k=document.getElementById('ai-preset').value;
+  const p=state.aiPresets[k];
+  if(p){ document.getElementById('ai-url').value=p.base_url; document.getElementById('ai-model').value=p.model; }
+}
+function toggleAI(){
+  const tg=document.getElementById('ai-on'); tg.classList.toggle('on');
+  document.getElementById('ai-panel').classList.toggle('hide',!tg.classList.contains('on'));
+}
+function aiConfig(){
+  const on=document.getElementById('ai-on').classList.contains('on');
+  if(!on) return {enabled:false};
+  return {
+    enabled:true,
+    preset:document.getElementById('ai-preset').value,
+    base_url:document.getElementById('ai-url').value.trim(),
+    model:document.getElementById('ai-model').value.trim(),
+    api_key:document.getElementById('ai-key').value.trim(),
+  };
+}
+async function testAI(){
+  const cfg=aiConfig();
+  if(!cfg.api_key) return toast('请先填写 API Key',false);
+  const msg=document.getElementById('ai-test-msg'); msg.textContent='测试中…';
+  const j=await api('/api/ai/test',{method:'POST',body:JSON.stringify(cfg)});
+  if(j.status){ msg.style.color='#1faa59'; msg.textContent='✅ 连接成功：'+(j.sample||''); }
+  else { msg.style.color='#e0483b'; msg.textContent='❌ '+(j.msg||'失败'); }
 }
 
 /* ---------- 抓题 ---------- */
 async function startFetch(){
   if(!state.course) return toast('请先选择课程',false);
-  if(state.mode==='single' && !state.point) return toast('请先选择章节',false);
+  const ai=aiConfig();
+  if(ai.enabled && !ai.api_key) return toast('已开启 AI 解析，请填写 API Key 或关闭该选项',false);
   const payload={
     course: state.course, mode: state.mode,
-    rounds: +document.getElementById('rounds').value,
-    concurrency: +document.getElementById('concurrency').value,
+    rounds: +(state.mode==='chapter'?document.getElementById('rounds2').value:document.getElementById('rounds').value),
+    count: +document.getElementById('count').value||50,
+    concurrency: +document.getElementById('concurrency').value||3,
     target: +document.getElementById('target').value||0,
     title: document.getElementById('paper-title').value.trim(),
     include_answers: document.getElementById('inc-ans').classList.contains('on'),
+    ai: ai,
   };
-  if(state.mode==='single') payload.point=state.point;
 
   document.getElementById('start-btn').disabled=true;
   document.getElementById('card-progress').classList.remove('hide');

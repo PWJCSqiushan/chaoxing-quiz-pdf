@@ -122,8 +122,78 @@ class QuizFetcher:
             self._emit(f"测验《{item.get('title')}》抓到 {len(qs)} 题")
         return self._dedup(all_q)
 
-    # ---------------- 模式B：全课程累积去重 ----------------
+    # ---------------- 模式：自测（self-test，从题库随机抽题） ----------------
 
+    def fetch_selftest(
+        self,
+        course: Dict,
+        count: int = 50,
+        rounds: int = 5,
+        target: int = 0,
+    ) -> List[Dict]:
+        """
+        通过超星“自测”功能从课程题库随机抽题，反复新建自测卷并去重累积。
+
+        count  ：每份自测卷抽题数量。
+        rounds ：最多新建多少份自测卷。
+        target ：目标题量，达到即停（0 表示抓到连续无新增为止）。
+        """
+        self._emit(f"准备自测抓题：{course.get('title', '')}")
+        meta = self.cx.get_selftest_meta(course)
+        self._emit("已读取自测页参数，开始新建自测卷抽题…")
+
+        collected: Dict[str, Dict] = {}
+        empty_streak = 0
+
+        for r in range(1, rounds + 1):
+            self._emit(f"第 {r}/{rounds} 份自测卷（每份抽 {count} 题）…")
+            try:
+                create_result = self.cx.create_selftest(course, meta, count=count)
+                if not create_result:
+                    self._emit("新建自测卷失败，跳过本轮")
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        self._emit("连续新建失败，停止")
+                        break
+                    continue
+                parsed = self.cx.fetch_selftest_questions(course, create_result, meta)
+            except Exception as e:
+                logger.debug(f"自测抓题异常: {e}")
+                self._emit(f"本轮抓题异常：{e}")
+                continue
+
+            before = len(collected)
+            if parsed:
+                source = parsed.get("_work_title", "自测")
+                for q in parsed.get("questions", []):
+                    item = {
+                        "id": q.get("id", ""),
+                        "type": q.get("type", "unknown"),
+                        "title": q.get("title", ""),
+                        "options": q.get("options", []),
+                        "answer": q.get("answer", ""),
+                        "analysis": q.get("analysis", ""),
+                        "source": source,
+                    }
+                    fp = question_fingerprint(item)
+                    if fp not in collected:
+                        collected[fp] = item
+
+            gained = len(collected) - before
+            self._emit(f"第 {r} 份新增 {gained} 题，累计 {len(collected)} 题")
+
+            if target and len(collected) >= target:
+                self._emit(f"已达目标题量 {target}，结束")
+                break
+            empty_streak = empty_streak + 1 if gained == 0 else 0
+            if empty_streak >= 2 and r >= 2:
+                self._emit("连续无新增题目，结束")
+                break
+            time.sleep(0.6)
+
+        return self._sort(list(collected.values()))
+
+    # ---------------- 模式B：全课程累积去重 ----------------
     def fetch_course_accumulate(
         self,
         course: Dict,

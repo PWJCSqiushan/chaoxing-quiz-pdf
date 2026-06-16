@@ -32,6 +32,7 @@ from api.database import (
 )
 from quiz_fetcher import QuizFetcher
 from pdf_builder import build_quiz_pdf
+from ai_explainer import AIExplainer, PRESETS as AI_PRESETS
 
 STATIC_DIR = os.path.join(SCRIPT_DIR, "web", "dist")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
@@ -212,24 +213,46 @@ def _run_fetch_task(task_id: str, uid: int, payload: dict):
     try:
         fetcher = QuizFetcher(cx, progress_cb=progress)
         course = payload["course"]
-        mode = payload.get("mode", "accumulate")
+        mode = payload.get("mode", "selftest")
 
         if mode == "single":
             point = payload["point"]
             questions = fetcher.fetch_single_chapter(course, point)
-        else:
+        elif mode == "chapter":
             questions = fetcher.fetch_course_accumulate(
                 course,
                 rounds=int(payload.get("rounds", 3)),
                 concurrency=int(payload.get("concurrency", 3)),
                 target=int(payload.get("target", 0)),
             )
+        else:  # selftest（默认）：从“自测”功能随机抽题
+            questions = fetcher.fetch_selftest(
+                course,
+                count=int(payload.get("count", 50)),
+                rounds=int(payload.get("rounds", 5)),
+                target=int(payload.get("target", 0)),
+            )
 
         if not questions:
             with _tasks_lock:
                 task["status"] = "failed"
-                task["message"] = "未抓取到任何题目（可能该课程无开放测验，或题库为空）"
+                task["message"] = "未抓取到任何题目（可能题库为空，或自测接口需校准）"
             return
+
+        # ---- 可选：AI 生成解析 ----
+        ai_cfg = payload.get("ai") or {}
+        if ai_cfg.get("enabled") and ai_cfg.get("api_key"):
+            try:
+                explainer = AIExplainer.from_config(ai_cfg)
+                progress("开始用 AI 为缺少解析的题目生成解析…")
+                explainer.explain_batch(
+                    questions,
+                    only_missing=not ai_cfg.get("overwrite", False),
+                    concurrency=int(ai_cfg.get("concurrency", 3)),
+                    progress_cb=progress,
+                )
+            except Exception as e:
+                progress(f"AI 解析步骤出错（已跳过）：{e}")
 
         progress(f"共抓取 {len(questions)} 题，正在生成 PDF…")
         title = payload.get("title") or f"{course.get('title', '超星')} 自测试卷"
@@ -251,6 +274,29 @@ def _run_fetch_task(task_id: str, uid: int, payload: dict):
         with _tasks_lock:
             task["status"] = "failed"
             task["message"] = f"任务失败: {e}"
+
+
+@app.route("/api/ai/presets", methods=["GET"])
+def api_ai_presets():
+    """返回 AI 解析的预设接口列表，供前端展示。"""
+    return _ok({k: {"label": v["label"], "base_url": v["base_url"], "model": v["model"]}
+                for k, v in AI_PRESETS.items()})
+
+
+@app.route("/api/ai/test", methods=["POST"])
+def api_ai_test():
+    """测试 AI 接口连通性。"""
+    _require_login()
+    cfg = request.json or {}
+    if not cfg.get("api_key"):
+        return _err("请填写 API Key")
+    try:
+        explainer = AIExplainer.from_config(cfg)
+        result = explainer.test_connection()
+    except Exception as e:
+        return _err(f"测试失败: {e}")
+    return (jsonify({"status": True, **result}) if result["status"]
+            else (jsonify({"status": False, "msg": result["msg"]}), 400))
 
 
 @app.route("/api/fetch", methods=["POST"])

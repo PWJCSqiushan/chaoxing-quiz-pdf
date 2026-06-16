@@ -164,6 +164,31 @@ class Chaoxing:
             uniq.append(c)
         return uniq
 
+    def get_course_meta(self, course: Dict) -> Dict:
+        """
+        访问课程学习主页（mycourse/stu），解析自测/考试所需的 enc 等隐藏字段。
+
+        该页面（即用户提供的源码）含有 examEnc / workEnc / enc / openc / fid 等关键参数，
+        自测模块的接口通常需要它们。
+        """
+        url = (
+            "https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/stu"
+            f"?courseid={course['courseId']}&clazzid={course['clazzId']}"
+            f"&cpi={course['cpi']}&ut=s&pageHeader=5&v=2"
+        )
+        meta: Dict[str, str] = {}
+        try:
+            resp = self.session.get(url)
+            soup = BeautifulSoup(resp.text, "lxml")
+            for key in ("enc", "openc", "oldenc", "workEnc", "examEnc", "fid",
+                        "cfid", "bbsid", "courseBelongSchoolId"):
+                el = soup.find("input", id=key) or soup.find("input", attrs={"name": key})
+                if el and el.get("value"):
+                    meta[key] = el["value"]
+        except Exception as e:
+            logger.debug(f"解析课程 meta 失败: {e}")
+        return meta
+
     def get_course_point(self, courseid: str, clazzid: str, cpi: str) -> Dict:
         _url = (
             f"https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse"
@@ -246,3 +271,137 @@ class Chaoxing:
                 return parsed
             time.sleep(1.0)
         return None
+
+    # ---------------- 自测（self-test / exam-list） ----------------
+    #
+    # “自测”是超星导航里 dataname="zc" 的独立模块，data-url 指向
+    #   https://mooc1.chaoxing.com/mooc2/exam/exam-list
+    # 用户可“新建自测”，设置抽题数量，由系统从课程题库随机抽题。
+    #
+    # 下列 URL / 参数集中放在这里，便于按真实抓包结果一行校准。
+    # ⚠️ 待用户提供抓包后核对：创建自测、加载题目两个接口的精确参数与字段名。
+
+    SELFTEST_LIST_URL = "https://mooc1.chaoxing.com/mooc2/exam/exam-list"
+    # 新建自测（创建一份随机抽题的自测卷）。具体字段以抓包为准。
+    SELFTEST_CREATE_URL = "https://mooc1.chaoxing.com/mooc2/exam/test-create"
+    # 进入自测答题页（返回题目 HTML，复用 decode_questions_info 解析）。
+    SELFTEST_START_URL = "https://mooc1.chaoxing.com/mooc2/exam/exam-test-reVersionTestStartNew"
+
+    def get_selftest_meta(self, course: Dict) -> Dict:
+        """
+        访问自测列表页 exam-list，解析新建自测所需的隐藏参数
+        （tId / courseId / classId / cpi / examEnc 等）。
+
+        返回 dict，至少包含课程标识；解析不到的字段留空，由抓包校准补齐。
+        """
+        meta = self.get_course_meta(course)
+        params = {
+            "courseId": course["courseId"],
+            "classId": course["clazzId"],
+            "cpi": course["cpi"],
+            "ut": "s",
+        }
+        result: Dict[str, str] = dict(params)
+        if meta.get("examEnc"):
+            result["enc"] = meta["examEnc"]
+        try:
+            resp = self.session.get(self.SELFTEST_LIST_URL, params=params)
+            soup = BeautifulSoup(resp.text, "lxml")
+            # 常见隐藏字段
+            for key in ("tId", "tid", "courseId", "classId", "clazzId", "cpi",
+                        "enc", "examEnc", "personId", "userId"):
+                el = soup.find("input", id=key) or soup.find("input", attrs={"name": key})
+                if el and el.get("value"):
+                    result[key] = el["value"]
+            result["_raw_len"] = str(len(resp.text))
+        except Exception as e:
+            logger.debug(f"解析自测列表页失败: {e}")
+        return result
+
+    def create_selftest(self, course: Dict, meta: Dict, count: int = 20,
+                         question_types: Optional[str] = None) -> Optional[Dict]:
+        """
+        新建一份自测卷（随机抽题）。
+
+        count          ：抽题数量。
+        question_types ：题型筛选（如需），以抓包字段为准。
+        返回创建结果（含 testpaperId / testId 等用于进入答题页），失败返回 None。
+
+        ⚠️ 字段名待抓包校准。当前按超星常见命名给出，便于快速对接。
+        """
+        data = {
+            "courseId": course["courseId"],
+            "classId": course["clazzId"],
+            "cpi": course["cpi"],
+            "ut": "s",
+            "questionNum": count,        # 抽题数量（字段名待校准）
+            "tId": meta.get("tId") or meta.get("tid", ""),
+            "enc": meta.get("enc") or meta.get("examEnc", ""),
+        }
+        if question_types:
+            data["questionType"] = question_types
+        try:
+            resp = self.session.post(self.SELFTEST_CREATE_URL, data=data)
+            if resp.status_code != 200:
+                logger.warning(f"新建自测失败: HTTP {resp.status_code}")
+                return None
+            # 返回可能是 JSON（含新建卷ID）或直接重定向到答题页
+            try:
+                j = resp.json()
+                return {"raw": j, "url": resp.url}
+            except ValueError:
+                return {"html": resp.text, "url": resp.url}
+        except requests.RequestException as e:
+            logger.warning(f"新建自测请求异常: {e}")
+            return None
+
+    def fetch_selftest_questions(self, course: Dict, create_result: Dict,
+                                 meta: Dict) -> Optional[Dict]:
+        """
+        进入自测答题页并解析题目（含答案）。
+
+        优先使用创建自测后返回的跳转 URL；否则用 SELFTEST_START_URL 拼参数。
+        复用 decode_questions_info 解析题干/选项/题型/答案。
+        """
+        html = None
+        # 1) 创建结果直接带回了答题页 HTML
+        if create_result and create_result.get("html") and "singleQuesId" in create_result["html"]:
+            html = create_result["html"]
+        # 2) 创建结果带回跳转 URL
+        if html is None and create_result and create_result.get("url"):
+            try:
+                resp = self.session.get(create_result["url"])
+                if resp.status_code == 200:
+                    html = resp.text
+            except requests.RequestException as e:
+                logger.debug(f"跟随自测跳转失败: {e}")
+        # 3) 兜底：用已知答题页接口
+        if html is None:
+            params = {
+                "courseId": course["courseId"],
+                "classId": course["clazzId"],
+                "cpi": course["cpi"],
+                "ut": "s",
+                "enc": meta.get("enc") or meta.get("examEnc", ""),
+            }
+            raw = create_result.get("raw") if create_result else None
+            if isinstance(raw, dict):
+                for k in ("testpaperId", "testPaperId", "testId", "examId", "id"):
+                    if raw.get("data", {}).get(k) if isinstance(raw.get("data"), dict) else raw.get(k):
+                        params["testpaperId"] = (raw.get("data", {}) or raw).get(k)
+                        break
+            try:
+                resp = self.session.get(self.SELFTEST_START_URL, params=params)
+                if resp.status_code == 200:
+                    html = resp.text
+            except requests.RequestException as e:
+                logger.debug(f"加载自测答题页失败: {e}")
+
+        if not html:
+            return None
+        parsed = decode_questions_info(html)
+        if parsed.get("questions"):
+            parsed["_work_title"] = f"{course.get('title', '')} 自测"
+            return parsed
+        return None
+
