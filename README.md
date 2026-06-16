@@ -88,18 +88,19 @@ chaoxing-quiz-pdf/
 
 ---
 
-## ⚙️ 抓题原理
+## ⚙️ 抓题原理（自测，已按真实接口实现）
 
-超星「自测」是从课程题库中**随机抽题**，没有公开的「导出整个题库」接口。本项目据此采用：
+超星「自测」从课程题库**随机抽题**，没有公开的「导出整库」接口。本项目复刻自测的完整流程：
 
-1. 进入课程的「自测」模块（导航 `dataname="zc"` → `https://mooc1.chaoxing.com/mooc2/exam/exam-list`）；
-2. 反复「新建自测」并设置抽题数量，让系统从题库随机抽题；
-3. 用 `decode_questions_info` 解析每份自测卷的题干 / 选项 / 题型 / 答案；
-4. 按**题干指纹去重累积**，把多次随机抽到的题目汇总为尽量完整的题库。
+1. `GET  /exam-ans/mooc2/exam/exam-question-count` —— 查询题库可抽题量；
+2. `POST /exam-ans/mooc2/exam/create-self-test`（`questionNum`=抽题数）—— 异步组卷，返回 `taskId`；
+3. `GET  /exam-ans/mooc2/exam/selftest-autopapertask-status?taskId=` —— 轮询至 `taskStatus:"ok"`，拿到 `paperId`；
+4. `GET  /exam-ans/mooc2/exam/exam-list` —— 解析列表里 `goTest(courseId, tId, relationId, endTime, paperId, isRetest, enc)`，按 `paperId` 定位本卷的 `tId / relationId / enc`；
+5. `GET  /exam-ans/exam/lookPaper?...&isPreview=true`（或 `reVersionTestStartNew`）—— 取整卷题目 HTML，用 `decode_questions_info` 解析。
 
-> 自测模块的创建 / 答题接口参数集中在 `api/base.py` 顶部的 `SELFTEST_*` 常量与对应方法中，
-> 便于按真实抓包结果快速校准。备用的「章节测验」模式走 `mooc-ans/api/work` 接口。
-> 抓不到答案的题目，可开启「AI 生成解析」补全，或在 PDF 中标注「（题库未提供）」。
+**反复新建自测 + 题干指纹去重**即可逼近完整题库（单卷上限常见 500 题）。
+相关接口集中在 `api/base.py` 的 `Chaoxing.EXAM_HOST` 与 `*selftest*` 方法。
+抓不到答案/解析的题，可开启「AI 生成解析」补全。
 
 ---
 

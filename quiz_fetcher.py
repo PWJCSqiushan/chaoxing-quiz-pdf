@@ -134,13 +134,18 @@ class QuizFetcher:
         """
         通过超星“自测”功能从课程题库随机抽题，反复新建自测卷并去重累积。
 
-        count  ：每份自测卷抽题数量。
+        count  ：每份自测卷抽题数量（受课程上限约束，常见 500）。
         rounds ：最多新建多少份自测卷。
         target ：目标题量，达到即停（0 表示抓到连续无新增为止）。
         """
         self._emit(f"准备自测抓题：{course.get('title', '')}")
         meta = self.cx.get_selftest_meta(course)
-        self._emit("已读取自测页参数，开始新建自测卷抽题…")
+        bank = self.cx.selftest_question_count(course)
+        if bank:
+            self._emit(f"题库可抽题量约 {bank} 题")
+        if not target and bank:
+            target = bank  # 默认以题库总量为目标
+        self._emit("开始新建自测卷抽题…")
 
         collected: Dict[str, Dict] = {}
         empty_streak = 0
@@ -148,42 +153,51 @@ class QuizFetcher:
         for r in range(1, rounds + 1):
             self._emit(f"第 {r}/{rounds} 份自测卷（每份抽 {count} 题）…")
             try:
-                create_result = self.cx.create_selftest(course, meta, count=count)
-                if not create_result:
-                    self._emit("新建自测卷失败，跳过本轮")
-                    empty_streak += 1
-                    if empty_streak >= 2:
-                        self._emit("连续新建失败，停止")
-                        break
-                    continue
-                parsed = self.cx.fetch_selftest_questions(course, create_result, meta)
+                parsed = self.cx.fetch_selftest_once(course, meta, count=count)
             except Exception as e:
                 logger.debug(f"自测抓题异常: {e}")
                 self._emit(f"本轮抓题异常：{e}")
                 continue
 
+            if not parsed:
+                self._emit("本轮新建/取卷失败，跳过")
+                empty_streak += 1
+                if empty_streak >= 2:
+                    self._emit("连续失败，停止")
+                    break
+                continue
+
+            qs = parsed.get("questions", [])
+            if not qs:
+                # 解析为 0 题：保存原始 HTML 供排查页面结构
+                self._save_debug_html(parsed.get("_raw_html", ""), parsed.get("_paper_id"))
+                self._emit("取到卷子但未解析出题目（已保存页面结构待排查）")
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                continue
+
             before = len(collected)
-            if parsed:
-                source = parsed.get("_work_title", "自测")
-                for q in parsed.get("questions", []):
-                    item = {
-                        "id": q.get("id", ""),
-                        "type": q.get("type", "unknown"),
-                        "title": q.get("title", ""),
-                        "options": q.get("options", []),
-                        "answer": q.get("answer", ""),
-                        "analysis": q.get("analysis", ""),
-                        "source": source,
-                    }
-                    fp = question_fingerprint(item)
-                    if fp not in collected:
-                        collected[fp] = item
+            source = parsed.get("_work_title", "自测")
+            for q in qs:
+                item = {
+                    "id": q.get("id", ""),
+                    "type": q.get("type", "unknown"),
+                    "title": q.get("title", ""),
+                    "options": q.get("options", []),
+                    "answer": q.get("answer", ""),
+                    "analysis": q.get("analysis", ""),
+                    "source": source,
+                }
+                fp = question_fingerprint(item)
+                if fp not in collected:
+                    collected[fp] = item
 
             gained = len(collected) - before
-            self._emit(f"第 {r} 份新增 {gained} 题，累计 {len(collected)} 题")
+            self._emit(f"第 {r} 份抽到 {len(qs)} 题，新增 {gained}，累计 {len(collected)} 题")
 
             if target and len(collected) >= target:
-                self._emit(f"已达目标题量 {target}，结束")
+                self._emit(f"已覆盖目标题量 {target}，结束")
                 break
             empty_streak = empty_streak + 1 if gained == 0 else 0
             if empty_streak >= 2 and r >= 2:
@@ -192,6 +206,20 @@ class QuizFetcher:
             time.sleep(0.6)
 
         return self._sort(list(collected.values()))
+
+    def _save_debug_html(self, html: str, paper_id):
+        if not html:
+            return
+        try:
+            import os
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"debug_paper_{paper_id or 'x'}.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.info(f"已保存自测卷原始 HTML: {path}")
+        except Exception as e:
+            logger.debug(f"保存调试 HTML 失败: {e}")
 
     # ---------------- 模式B：全课程累积去重 ----------------
     def fetch_course_accumulate(
