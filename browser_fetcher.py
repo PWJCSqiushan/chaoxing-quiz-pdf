@@ -80,7 +80,9 @@ class BrowserGrabber:
 
         meta = self.cx.get_selftest_meta(course)
         bank = self.cx.selftest_question_count(course)
-        if bank:
+        if bank < 0:
+            self._emit("无法读取题库（超星会话可能已失效，请退出后重新登录超星账号）")
+        elif bank > 0:
             self._emit(f"题库可抽题量约 {bank} 题")
             if not target:
                 target = bank
@@ -92,59 +94,68 @@ class BrowserGrabber:
             browser = p.chromium.launch(headless=self.headless)
             context = browser.new_context()
             try:
-                context.add_cookies(self._cookies_for_playwright())
-            except Exception as e:
-                logger.debug(f"注入 cookie 失败: {e}")
-            page = context.new_page()
+                try:
+                    context.add_cookies(self._cookies_for_playwright())
+                except Exception as e:
+                    logger.debug(f"注入 cookie 失败: {e}")
+                page = context.new_page()
 
-            for r in range(1, papers + 1):
-                self._emit(f"第 {r}/{papers} 份自测卷（抽 {count} 题）：创建中…")
-                # —— 用 requests 创建并定位（不被验证码拦）——
-                task_id = self.cx.create_selftest(course, meta, count=count)
-                if not task_id:
-                    self._emit("新建自测失败，跳过")
-                    empty_streak += 1
-                    if empty_streak >= 2:
+                for r in range(1, papers + 1):
+                    self._emit(f"第 {r}/{papers} 份自测卷（抽 {count} 题）：创建中…")
+                    # —— 用 requests 创建并定位（不被验证码拦）——
+                    task_id = self.cx.create_selftest(course, meta, count=count)
+                    if not task_id:
+                        self._emit("新建自测失败，跳过")
+                        empty_streak += 1
+                        if empty_streak >= 2:
+                            break
+                        continue
+                    paper_id = self.cx.poll_selftest_paper(course, task_id)
+                    if not paper_id:
+                        self._emit("组卷失败，跳过")
+                        continue
+                    entry = self.cx.find_paper_entry(course, paper_id, meta)
+                    if not entry:
+                        self._emit("未定位到自测卷入口，跳过")
+                        continue
+
+                    # —— 浏览器里打开答题流程 ——
+                    html = self._open_and_extract(context, page, course, entry, per_paper_timeout)
+                    if not html:
+                        self._emit("本份未取到题目页（超时或被关闭）")
+                        empty_streak += 1
+                        if empty_streak >= 2:
+                            self._emit("连续失败，停止")
+                            break
+                        continue
+
+                    before = len(collected)
+                    qs = self._parse(html, paper_id)
+                    for q in qs:
+                        q["source"] = f"{course.get('title','')} 自测"
+                        fp = question_fingerprint(q)
+                        if fp not in collected:
+                            collected[fp] = q
+                    gained = len(collected) - before
+                    self._emit(f"第 {r} 份解析到 {len(qs)} 题，新增 {gained}，累计 {len(collected)} 题")
+
+                    if target and len(collected) >= target:
+                        self._emit(f"已覆盖目标题量 {target}，结束")
                         break
-                    continue
-                paper_id = self.cx.poll_selftest_paper(course, task_id)
-                if not paper_id:
-                    self._emit("组卷失败，跳过")
-                    continue
-                entry = self.cx.find_paper_entry(course, paper_id, meta)
-                if not entry:
-                    self._emit("未定位到自测卷入口，跳过")
-                    continue
-
-                # —— 浏览器里打开答题流程 ——
-                html = self._open_and_extract(context, page, course, entry, per_paper_timeout)
-                if not html:
-                    self._emit("本份未取到题目页（超时或被关闭）")
-                    empty_streak += 1
-                    if empty_streak >= 2:
-                        self._emit("连续失败，停止")
+                    empty_streak = 0 if gained else empty_streak + 1
+                    if empty_streak >= 2 and r >= 2:
+                        self._emit("连续无新增，结束")
                         break
-                    continue
-
-                before = len(collected)
-                qs = self._parse(html, paper_id)
-                for q in qs:
-                    q["source"] = f"{course.get('title','')} 自测"
-                    fp = question_fingerprint(q)
-                    if fp not in collected:
-                        collected[fp] = q
-                gained = len(collected) - before
-                self._emit(f"第 {r} 份解析到 {len(qs)} 题，新增 {gained}，累计 {len(collected)} 题")
-
-                if target and len(collected) >= target:
-                    self._emit(f"已覆盖目标题量 {target}，结束")
-                    break
-                empty_streak = 0 if gained else empty_streak + 1
-                if empty_streak >= 2 and r >= 2:
-                    self._emit("连续无新增，结束")
-                    break
-
-            browser.close()
+            finally:
+                # 异常路径也确保上下文与浏览器被关闭，回收资源
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         return QuizFetcher._sort(list(collected.values()))
 
@@ -173,32 +184,42 @@ class BrowserGrabber:
                     break
             except Exception:
                 pass
-        # “进入考试”按钮可能开新标签页
+        # “进入考试”按钮可能开新标签页；只点击一次，避免同页跳转时重复点击
         answer_page = page
+        clicked = False
         try:
             with context.expect_page(timeout=5000) as pop:
                 self._click_enter(page)
+                clicked = True
             answer_page = pop.value
         except Exception:
-            # 没有新开标签，可能在当前页跳转或等待用户手动点击
-            self._click_enter(page)
+            # 没有新开标签：若上面因点击前就异常未点到，则补点一次（同页跳转）
+            if not clicked:
+                self._click_enter(page)
             answer_page = self._latest_question_page(context) or page
 
         # 轮询等待题目渲染（用户此时在过验证码）
         deadline = time.time() + timeout
         while time.time() < deadline:
             ap = self._latest_question_page(context) or answer_page
+            # DOM 级判定：真正存在题目容器元素，且容器内有���本，才算渲染完成
+            rendered = False
             try:
-                content = ap.content()
+                loc = ap.locator(
+                    "div.singleQuesId, div.questionLi, div.TiMu, div.timu, div.Cy_ulTk"
+                )
+                if loc.count() > 0:
+                    txt = (loc.first.inner_text(timeout=1500) or "").strip()
+                    rendered = len(txt) > 0
             except Exception:
-                content = ""
-            if content and any(k in content for k in QUESTION_MARKERS):
+                rendered = False
+            if rendered:
                 self._emit("✓ 检测到题目已渲染，正在提取…")
                 time.sleep(1.0)
                 try:
                     return ap.content()
                 except Exception:
-                    return content
+                    return None
             time.sleep(2.0)
         return None
 
@@ -213,10 +234,13 @@ class BrowserGrabber:
                 pass
 
     def _latest_question_page(self, context):
-        """在所有打开的标签里找出含题目特征的那个。"""
+        """在所有打开的标签里找出答题页（排除考试须知页 examnotes）。"""
         for pg in reversed(context.pages):
             try:
-                if any(k in (pg.url or "") for k in ["reVersionTestStart", "lookPaper", "/exam/test/"]):
+                url = pg.url or ""
+                if "examnotes" in url:
+                    continue
+                if any(k in url for k in ["reVersionTestStart", "lookPaper"]) or "/exam/test/" in url:
                     return pg
             except Exception:
                 continue

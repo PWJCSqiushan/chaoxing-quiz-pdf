@@ -13,6 +13,8 @@ users.db-shm
 sessions/
 cookies*.txt
 output/*.pdf
+output/*.html
+.app_secret_key
 *.log
 
 # 前端构建

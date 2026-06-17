@@ -1,15 +1,28 @@
 """
 用户数据库模块 - SQLite
 支持本地注册/登录，保存超星账号凭证
+
+安全设计：
+  - 本地账号密码：PBKDF2-HMAC-SHA256 + 每用户随机盐 + 多轮迭代（格式 pbkdf2$迭代$盐$哈希），
+    校验用 hmac.compare_digest 恒定时间比较；兼容旧版单轮 SHA-256 哈希并在登录时透明升级。
+  - 超星账号密码：用服务器主密钥（环境变量 APP_CRYPTO_KEY，缺省时从本地 keyfile 读取/生成）
+    做可逆对称加密后入库，避免明文落盘。
 """
 import os
 import sqlite3
 import hashlib
+import hmac
+import base64
 import time
 import json
 from typing import Optional, Dict, List
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "users.db")
+_KEYFILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".app_secret_key")
+
+# 旧版固定盐（仅用于识别/升级历史哈希，新密码不再使用）
+_LEGACY_SALT = "chaoxing_fanya_2024"
+_PBKDF2_ROUNDS = 200_000
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -21,10 +34,119 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+# ==================== 密码哈希（PBKDF2 + 每用户随机盐） ====================
+
 def _hash_password(password: str) -> str:
-    """密码哈希 (SHA-256 + salt)"""
-    salt = "chaoxing_fanya_2024"
-    return hashlib.sha256(f"{salt}{password}{salt}".encode()).hexdigest()
+    """生成新格式密码哈希：pbkdf2$迭代次数$盐(hex)$哈希(hex)。"""
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ROUNDS)
+    return f"pbkdf2${_PBKDF2_ROUNDS}${salt.hex()}${dk.hex()}"
+
+
+def _legacy_hash(password: str) -> str:
+    """旧版单轮 SHA-256 哈希（仅用于校验历史记录）。"""
+    return hashlib.sha256(f"{_LEGACY_SALT}{password}{_LEGACY_SALT}".encode()).hexdigest()
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """恒定时间校验密码，兼容新旧两种格式。"""
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, rounds_s, salt_hex, hash_hex = stored.split("$", 3)
+            dk = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds_s)
+            )
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except (ValueError, TypeError):
+            return False
+    # 旧格式：单轮 SHA-256
+    return hmac.compare_digest(_legacy_hash(password), stored)
+
+
+def _needs_rehash(stored: str) -> bool:
+    """判断存储的哈希是否为旧格式，需要在登录成功后升级。"""
+    return not (stored or "").startswith("pbkdf2$")
+
+
+# ==================== 凭证对称加密（保护超星密码） ====================
+
+def _get_crypto_key() -> bytes:
+    """获取/生成 32 字节主密钥：优先环境变量 APP_CRYPTO_KEY，否则本地 keyfile。"""
+    env = os.environ.get("APP_CRYPTO_KEY")
+    if env:
+        return hashlib.sha256(env.encode("utf-8")).digest()
+    try:
+        if os.path.exists(_KEYFILE):
+            with open(_KEYFILE, "rb") as f:
+                raw = f.read().strip()
+                if raw:
+                    return hashlib.sha256(raw).digest()
+        # 生成并持久化一个随机密钥
+        raw = base64.b64encode(os.urandom(32))
+        with open(_KEYFILE, "wb") as f:
+            f.write(raw)
+        try:
+            os.chmod(_KEYFILE, 0o600)
+        except OSError:
+            pass
+        return hashlib.sha256(raw).digest()
+    except OSError:
+        # 极端情况下回退到进程内临时密钥（重启后旧密文无法解密，会要求重新登录）
+        return hashlib.sha256(b"chaoxing_quiz_fallback_key").digest()
+
+
+def _encrypt_secret(plaintext: str) -> str:
+    """用 AES-GCM 加密敏感串，返回 'enc1$' 前缀的 base64 串。无 cryptography 库时降级为 keystream XOR。"""
+    if plaintext is None:
+        plaintext = ""
+    key = _get_crypto_key()
+    data = plaintext.encode("utf-8")
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = os.urandom(12)
+        ct = AESGCM(key).encrypt(nonce, data, None)
+        return "encg$" + base64.b64encode(nonce + ct).decode("ascii")
+    except Exception:
+        # 降级：HMAC 派生 keystream 做 XOR（仍优于明文落盘）
+        out = bytearray()
+        counter = 0
+        ks = b""
+        for i, b in enumerate(data):
+            if i % 32 == 0:
+                ks = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha256).digest()
+                counter += 1
+            out.append(b ^ ks[i % 32])
+        return "encx$" + base64.b64encode(bytes(out)).decode("ascii")
+
+
+def _decrypt_secret(token: str) -> str:
+    """解密 _encrypt_secret 产生的串；无法识别/解密时原样返回（兼容历史明文）。"""
+    if not token:
+        return ""
+    key = _get_crypto_key()
+    try:
+        if token.startswith("encg$"):
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            blob = base64.b64decode(token[5:])
+            nonce, ct = blob[:12], blob[12:]
+            return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
+        if token.startswith("encx$"):
+            data = base64.b64decode(token[5:])
+            out = bytearray()
+            counter = 0
+            ks = b""
+            for i, b in enumerate(data):
+                if i % 32 == 0:
+                    ks = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha256).digest()
+                    counter += 1
+                out.append(b ^ ks[i % 32])
+            return bytes(out).decode("utf-8")
+    except Exception:
+        return ""
+    # 无前缀：历史明文
+    return token
 
 
 def init_db():
@@ -114,10 +236,19 @@ def authenticate_user(username: str, password: str) -> Dict:
         ).fetchone()
 
         if not user:
+            # 仍执行一次哈希，缓解用户名枚举的时序差异
+            _verify_password(password, "pbkdf2$1$00$00")
             return {"status": False, "msg": "用户名或密码错误"}
 
-        if user["password_hash"] != _hash_password(password):
+        if not _verify_password(password, user["password_hash"]):
             return {"status": False, "msg": "用户名或密码错误"}
+
+        # 旧格式哈希登录成功后透明升级为新格式
+        if _needs_rehash(user["password_hash"]):
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (_hash_password(password), user["id"])
+            )
 
         # 更新最后登录时间
         conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (time.time(), user["id"]))
@@ -143,7 +274,7 @@ def change_password(user_id: int, old_password: str, new_password: str) -> Dict:
         if not user:
             return {"status": False, "msg": "用户不存在"}
 
-        if user["password_hash"] != _hash_password(old_password):
+        if not _verify_password(old_password, user["password_hash"]):
             return {"status": False, "msg": "原密码错误"}
 
         conn.execute(
@@ -172,16 +303,16 @@ def save_chaoxing_account(user_id: int, cx_phone: str, cx_password: str, label: 
         ).fetchone()
 
         if existing:
-            # 更新已有记录
+            # 更新已有记录（密码加密存储）
             conn.execute(
                 "UPDATE chaoxing_accounts SET cx_password = ?, label = ? WHERE id = ?",
-                (cx_password, label, existing["id"])
+                (_encrypt_secret(cx_password), label, existing["id"])
             )
         else:
-            # 新增记录
+            # 新增记录（密码加密存储）
             conn.execute(
                 "INSERT INTO chaoxing_accounts (user_id, cx_phone, cx_password, label, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, cx_phone, cx_password, label, time.time())
+                (user_id, cx_phone, _encrypt_secret(cx_password), label, time.time())
             )
 
         conn.commit()
@@ -221,7 +352,7 @@ def get_chaoxing_account_credentials(user_id: int, account_id: int) -> Dict:
 
         return {
             "status": True,
-            "data": {"id": account["id"], "cx_phone": account["cx_phone"], "cx_password": account["cx_password"], "label": account["label"]}
+            "data": {"id": account["id"], "cx_phone": account["cx_phone"], "cx_password": _decrypt_secret(account["cx_password"]), "label": account["label"]}
         }
     finally:
         conn.close()

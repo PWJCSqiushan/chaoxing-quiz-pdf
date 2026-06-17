@@ -231,6 +231,7 @@ async function api(path, opts={}){
   const r = await fetch(API+path, opts);
   let j; try{ j= await r.json(); }catch{ j={status:false,msg:'网络错误'}; }
   if(r.status===401){ showAuth(); throw new Error('未登录'); }
+  if(typeof j==='object' && j) j.code=r.status;
   return j;
 }
 
@@ -300,15 +301,18 @@ async function loadCourses(){
     const d=document.createElement('div'); d.className='it';
     d.innerHTML=`<span class="t">${esc(c.title)}</span><span class="m">${esc(c.teacher||'')}</span>`;
     d.onclick=()=>{ state.course=c; [...box.children].forEach(x=>x.classList.remove('on')); d.classList.add('on');
-      document.getElementById('mode-area').classList.remove('hide'); document.getElementById('chapters').classList.add('hide'); };
+      document.getElementById('mode-area').classList.remove('hide');
+      const chBox=document.getElementById('chapters'); if(chBox) chBox.classList.add('hide'); };
     box.appendChild(d);
   });
 }
 async function loadChapters(){
   if(!state.course) return toast('请先选择课程',false);
+  const box=document.getElementById('chapters');
+  if(!box) return;  // 当前三种模式均不需要章节列表
   const j=await api('/api/chapters',{method:'POST',body:JSON.stringify(state.course)});
   if(!j.status) return toast(j.msg,false);
-  const box=document.getElementById('chapters'); box.innerHTML=''; box.classList.remove('hide');
+  box.innerHTML=''; box.classList.remove('hide');
   j.data.forEach(p=>{
     const d=document.createElement('div'); d.className='it';
     d.innerHTML=`<span class="t">${esc(p.title)}</span>`;
@@ -396,13 +400,23 @@ async function startFetch(){
   state.taskId=j.data.task_id;
   pollTask();
 }
-async function pollTask(){
+async function pollTask(retries){
+  retries = retries || 0;
   const logBox=document.getElementById('log');
   const j=await api('/api/task/'+state.taskId);
-  if(!j.status){ return toast(j.msg,false); }
+  if(!j.status){
+    // 任务确实不存在(404)才放弃；网络抖动则有限次重试，不中断进度刷新
+    if(j.code===404 || retries>=6){
+      document.getElementById('pbar').classList.add('hide');
+      document.getElementById('start-btn').disabled=false;
+      return toast(j.msg||'获取进度失败',false);
+    }
+    setTimeout(()=>pollTask(retries+1), 2000);
+    return;
+  }
   document.getElementById('prog-msg').textContent=j.data.message||'处理中…';
   logBox.textContent=(j.data.logs||[]).join('\n'); logBox.scrollTop=logBox.scrollHeight;
-  if(j.data.status==='running'){ setTimeout(pollTask,1200); return; }
+  if(j.data.status==='running'){ setTimeout(()=>pollTask(0),1200); return; }
   document.getElementById('pbar').classList.add('hide');
   document.getElementById('start-btn').disabled=false;
   if(j.data.status==='failed'){ toast(j.data.message,false); return; }

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+import secrets
 from typing import Dict, Optional
 
 from flask import (
@@ -45,9 +46,29 @@ else:
     fallback = os.path.join(SCRIPT_DIR, "web")
     app = Flask(__name__, static_folder=fallback, static_url_path="")
 
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "chaoxing_quiz_pdf_secret_2026")
+# SECRET_KEY：优先环境变量；缺失时随机生成（重启后旧会话失效），绝不使用可预测的硬编码默认值。
+_secret = os.environ.get("FLASK_SECRET_KEY")
+if not _secret:
+    _secret = secrets.token_hex(32)
+    logger.warning("未设置 FLASK_SECRET_KEY，已临时随机生成；重启后所有登录态会失效。"
+                   "生产环境请通过环境变量固定该密钥。")
+app.secret_key = _secret
 app.permanent_session_lifetime = 60 * 60 * 24 * 7
-CORS(app, supports_credentials=True)
+# Session Cookie 安全属性
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+)
+
+# CORS：仅允许显式配置的来源携带凭证（逗号分隔的 CORS_ORIGINS）。
+# 默认不开放跨域（生产建议前后端同源部署）。
+_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if _origins:
+    CORS(app, supports_credentials=True, origins=_origins)
+else:
+    # 同源使用时无需 CORS 头；不反射任意 Origin，避免带凭证的跨站滥用。
+    CORS(app, supports_credentials=True, origins=[])
 
 # 内存态：user_id -> Chaoxing 实例
 _cx_instances: Dict[int, Chaoxing] = {}
@@ -56,6 +77,27 @@ _cx_lock = threading.Lock()
 # 内存态：task_id -> 任务信息
 _tasks: Dict[str, dict] = {}
 _tasks_lock = threading.Lock()
+
+# 任务/PDF 保留时长与日志条数上限
+_TASK_TTL = 60 * 60 * 6          # 已完成任务保留 6 小时
+_TASK_LOG_MAX = 500              # 单任务日志最多保留条数
+
+
+def _cleanup_tasks():
+    """淘汰过期的已完成任务，并删除其 PDF 文件。须在持有 _tasks_lock 时调用。"""
+    now = time.time()
+    expired = [
+        tid for tid, t in _tasks.items()
+        if t.get("status") in ("done", "failed")
+        and now - t.get("created", now) > _TASK_TTL
+    ]
+    for tid in expired:
+        t = _tasks.pop(tid, None)
+        if t and t.get("pdf"):
+            try:
+                os.remove(os.path.join(OUTPUT_DIR, t["pdf"]))
+            except OSError:
+                pass
 
 
 # ==================== 工具 ====================
@@ -114,7 +156,17 @@ def api_login():
 
 @app.route("/api/logout", methods=["POST"])
 def api_logout():
+    uid = _current_user()
     session.clear()
+    # 释放内存中的超星实例与其 cookie
+    if uid is not None:
+        with _cx_lock:
+            cx = _cx_instances.pop(uid, None)
+        if cx is not None:
+            try:
+                cx.session.close()
+            except Exception:
+                pass
     return _ok(msg="已退出登录")
 
 
@@ -203,11 +255,17 @@ def api_chapters():
 
 def _run_fetch_task(task_id: str, uid: int, payload: dict):
     cx = _get_cx(uid)
-    task = _tasks[task_id]
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        return
 
     def progress(msg: str):
         with _tasks_lock:
             task["logs"].append({"t": time.time(), "msg": msg})
+            # 限制日志长度，避免长任务无限增长
+            if len(task["logs"]) > _TASK_LOG_MAX:
+                del task["logs"][:-_TASK_LOG_MAX]
             task["message"] = msg
 
     try:
@@ -320,6 +378,7 @@ def api_fetch():
 
     task_id = uuid.uuid4().hex[:16]
     with _tasks_lock:
+        _cleanup_tasks()
         _tasks[task_id] = {
             "id": task_id, "uid": uid, "status": "running",
             "message": "任务已创建", "logs": [], "count": 0, "pdf": None,

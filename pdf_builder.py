@@ -43,9 +43,18 @@ _FONT_CANDIDATES = [
 
 
 def _find_font() -> Optional[str]:
+    """返回首个存在且能被 fpdf2 成功加载的字体路径。"""
     for p in _FONT_CANDIDATES:
-        if os.path.exists(p):
+        if not os.path.exists(p):
+            continue
+        try:
+            # 用临时 FPDF 试加载，能加载才采用（过滤损坏/不兼容的 TTC）
+            probe = FPDF()
+            probe.add_font("probe", "", p)
             return p
+        except Exception as e:
+            logger.warning(f"字体 {p} 无法加载，跳过：{type(e).__name__}")
+            continue
     return None
 
 
@@ -197,7 +206,7 @@ def _render_question(pdf: QuizPDF, no: int, q: Dict, with_answer: bool = False):
     _mc(pdf, 7, f"{no}. {title}")
     # 选项
     for opt in q.get("options", []):
-        _mc(pdf, 6.5, "    " + opt)
+        _mc(pdf, 6.5, "    " + _safe(opt))
     # 作答区
     qtype = q.get("type")
     if qtype == "judgement":

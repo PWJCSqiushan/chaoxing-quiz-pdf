@@ -39,11 +39,23 @@ def _normalize(text: str) -> str:
     return text.lower()
 
 
+def _strip_option_prefix(text: str) -> str:
+    """去掉选项前导字母标号，如 'A. xxx' / 'B、yyy' / 'C) zzz' → 'xxx'。"""
+    if not text:
+        return ""
+    return re.sub(r"^\s*[A-Za-z]\s*[.、,)）：:]\s*", "", text.strip())
+
+
 def question_fingerprint(q: Dict) -> str:
-    """根据题型+题干+选项生成稳定指纹。"""
+    """
+    根据题型+题干+选项生成稳定指纹。
+
+    选项先剥离字母标号再归一化，并**排序**后拼接——因为超星自测每次抽题
+    选项顺序随机，唯有顺序无关的指纹才能让同一题在多轮抽题中被正确去重。
+    """
     basis = q.get("type", "") + _normalize(q.get("title", ""))
-    opts = "".join(_normalize(o) for o in q.get("options", []))
-    basis += opts
+    opts = sorted(_normalize(_strip_option_prefix(o)) for o in q.get("options", []))
+    basis += "".join(opts)
     return hashlib.md5(basis.encode("utf-8")).hexdigest()
 
 
@@ -141,10 +153,12 @@ class QuizFetcher:
         self._emit(f"准备自测抓题：{course.get('title', '')}")
         meta = self.cx.get_selftest_meta(course)
         bank = self.cx.selftest_question_count(course)
-        if bank:
+        if bank < 0:
+            self._emit("无法读取题库（超星会话可能已失效，请退出后重新登录超星账号）")
+        elif bank > 0:
             self._emit(f"题库可抽题量约 {bank} 题")
-        if not target and bank:
-            target = bank  # 默认以题库总量为目标
+            if not target:
+                target = bank  # 默认以题库总量为目标
         self._emit("开始新建自测卷抽题…")
 
         collected: Dict[str, Dict] = {}

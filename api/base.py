@@ -7,6 +7,7 @@
 """
 import functools
 import json
+import os
 import random
 import re
 import threading
@@ -28,6 +29,10 @@ from api.decode import (
     decode_questions_info,
 )
 from api.logger import logger
+
+# 调试落盘开关：含会话 enc/请求 URL 等敏感信息，默认开启（仍在校准答题页结构）。
+# 生产环境可设环境变量 CX_DEBUG_DUMP=0 关闭。落盘文件已在 .gitignore 中排除。
+_DEBUG_DUMP = os.environ.get("CX_DEBUG_DUMP", "1") == "1"
 
 
 def get_timestamp() -> str:
@@ -75,6 +80,19 @@ class Chaoxing:
         saved = load_cookies(self._cookies_path)
         if saved:
             self.session.cookies.update(saved)
+
+    def close(self):
+        """释放底层 requests.Session 连接池。"""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     # ---------------- 登录 ----------------
 
@@ -288,7 +306,11 @@ class Chaoxing:
 
     def selftest_question_count(self, course: Dict, create_type: int = 0,
                                 do_no_repeat: bool = False) -> int:
-        """查询课程题库可抽题量。create_type=0 全部题库，1 错题。"""
+        """查询课程题库可抽题量。create_type=0 全部题库，1 错题。
+
+        返回 -1 表示会话疑似失效/被拦（响应非 JSON，如返回登录页），
+        与“题库为 0 题”区分，便于上层提示用户重新登录。
+        """
         try:
             resp = self.session.get(
                 f"{self.EXAM_HOST}/mooc2/exam/exam-question-count",
@@ -300,10 +322,15 @@ class Chaoxing:
                     "doNoRepeat": str(do_no_repeat).lower(),
                 },
             )
-            return int(resp.json().get("count", 0))
-        except Exception as e:
-            logger.debug(f"查询题库题量失败: {e}")
-            return 0
+            try:
+                return int(resp.json().get("count", 0))
+            except ValueError:
+                # 非 JSON：多半是登录页/拦截页，会话可能已失效
+                logger.warning("查询题库题量返回非 JSON（会话可能已失效，请重新登录超星）")
+                return -1
+        except requests.RequestException as e:
+            logger.debug(f"查询题库题量网络异常: {e}")
+            return -1
 
     def create_selftest(self, course: Dict, meta: Dict, count: int = 50,
                         title: str = "auto") -> Optional[int]:
@@ -442,16 +469,18 @@ class Chaoxing:
         for e in entries:
             if str(e["paperId"]) == str(paper_id):
                 return e
-        # 没找到：保存列表 HTML 便于排查
-        try:
-            import os
-            d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "debug_examlist.html"), "w", encoding="utf-8") as f:
-                f.write(html)
-            logger.warning(f"未匹配 paperId={paper_id}；已保存 exam-list HTML（{len(html)} 字符）到 output/debug_examlist.html")
-        except Exception:
-            pass
+        # 没找到：保存列表 HTML 便于排查（仅在调试开关开启时）
+        if _DEBUG_DUMP:
+            try:
+                d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "debug_examlist.html"), "w", encoding="utf-8") as f:
+                    f.write(html)
+                logger.warning(f"未匹配 paperId={paper_id}；已保存 exam-list HTML（{len(html)} 字符）到 output/debug_examlist.html")
+            except Exception:
+                pass
+        else:
+            logger.warning(f"未匹配 paperId={paper_id}（调试落盘已关闭）")
         return None
 
     def _get_start_enc(self, course: Dict, entry: Dict) -> str:
@@ -475,15 +504,15 @@ class Chaoxing:
             )
             text = (resp.text or "").strip()
             logger.debug(f"getIdentifyCode 原始响应: {text[:300]}")
-            # 落盘完整响应，便于确认是否为验证码/验证页
-            try:
-                import os
-                d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
-                os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "debug_identify.html"), "w", encoding="utf-8") as f:
-                    f.write(f"REQUEST_URL: {resp.url}\nSTATUS: {resp.status_code}\n\n{resp.text}")
-            except Exception:
-                pass
+            # 落盘完整响应，便于确认是否为验证码/验证页（仅调试开关开启时）
+            if _DEBUG_DUMP:
+                try:
+                    d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, "debug_identify.html"), "w", encoding="utf-8") as f:
+                        f.write(f"REQUEST_URL: {resp.url}\nSTATUS: {resp.status_code}\n\n{resp.text}")
+                except Exception:
+                    pass
             # 优先严格 JSON
             try:
                 data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))

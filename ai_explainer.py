@@ -15,6 +15,7 @@ AI 解析生成模块（OpenAI 兼容接口）。
 """
 import concurrent.futures
 import json
+import time
 from typing import Callable, Dict, List, Optional
 
 import requests
@@ -67,6 +68,7 @@ class AIExplainer:
             base_url=base_url or "https://api.deepseek.com/v1",
             model=model or "deepseek-chat",
             temperature=float(cfg.get("temperature", 0.3)),
+            timeout=int(cfg.get("timeout", 40)),
         )
 
     def _build_prompt(self, q: Dict) -> str:
@@ -78,8 +80,8 @@ class AIExplainer:
         parts.append(f"正确答案：{ans if ans else '（未提供，请你根据题目推断并给出答案与解析）'}")
         return "\n".join(parts)
 
-    def explain_one(self, q: Dict) -> str:
-        """为单题生成解析，失败返回空字符串。"""
+    def explain_one(self, q: Dict, max_retries: int = 3) -> str:
+        """为单题生成解析，失败返回空字符串。对 429/5xx/网络错误做指数退避重试。"""
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -94,20 +96,39 @@ class AIExplainer:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
-        except requests.RequestException as e:
-            logger.warning(f"AI 解析请求失败: {e}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
+            except requests.RequestException as e:
+                logger.warning(f"AI 解析请求失败（第 {attempt}/{max_retries} 次）: {type(e).__name__}")
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                return ""
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+                    return content.strip()
+                except (KeyError, ValueError, IndexError, TypeError, AttributeError) as e:
+                    logger.warning(f"AI 解析响应解析失败: {type(e).__name__}")
+                    return ""
+            # 429 限流 / 5xx 服务端错误：可重试
+            if resp.status_code == 429 or resp.status_code >= 500:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else min(2 ** attempt, 10)
+                except ValueError:
+                    wait = min(2 ** attempt, 10)
+                logger.warning(f"AI 解析返回 {resp.status_code}（第 {attempt}/{max_retries} 次），{wait:.0f}s 后重试")
+                if attempt < max_retries:
+                    time.sleep(wait)
+                    continue
+                return ""
+            # 其他 4xx（如 401/400）：不重试，仅记录状态码（避免落盘响应体）
+            logger.warning(f"AI 解析返回 {resp.status_code}（不可重试）")
             return ""
-        if resp.status_code != 200:
-            logger.warning(f"AI 解析返回 {resp.status_code}: {resp.text[:200]}")
-            return ""
-        try:
-            data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
-        except (KeyError, ValueError, IndexError) as e:
-            logger.warning(f"AI 解析响应解析失败: {e}")
-            return ""
+        return ""
 
     def test_connection(self) -> Dict:
         """测试 API 连通性。"""

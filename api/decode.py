@@ -304,8 +304,10 @@ def decode_exam_questions(soup_or_html, font_decoder=None) -> List[Dict[str, Any
 
 def _process_exam_question(node, idx: int, font_decoder=None) -> Optional[Dict[str, Any]]:
     """解析单个考试题目容器。"""
-    # 题型：优先取容器或题干元素的 data 属性，其次从题干文字里的 “（单选题）” 推断
-    type_code = node.attrs.get("data", "") or node.attrs.get("type", "")
+    # 容器的 data 属性在考试页通常是“题目ID”（长数字），不是题型码，
+    # 故题型优先从题干文字推断（如 “（单选题）”），仅当 data 是已知的小题型码时才采用。
+    raw_data = node.attrs.get("data", "") or ""
+    type_attr = node.attrs.get("type", "")
 
     # 题干
     title_el = None
@@ -315,14 +317,24 @@ def _process_exam_question(node, idx: int, font_decoder=None) -> Optional[Dict[s
         if title_el:
             break
     raw_title = _extract_title(title_el, font_decoder) if title_el else ""
-    if not type_code and title_el:
-        type_code = title_el.attrs.get("data", "") or type_code
 
-    # 从题干文字推断题型（如 “（单选题）”“【多选题】”）
+    # 题型推断：优先文字推断；其次题干元素/容器上明确的题型码（短码，非长数字ID）
     inferred = _infer_type_from_text(raw_title)
-    q_type = _get_question_type(type_code) if type_code not in ("", None) else inferred
-    if q_type == "unknown" and inferred != "unknown":
-        q_type = inferred
+    q_type = inferred
+    if q_type == "unknown":
+        candidate = ""
+        if title_el and title_el.attrs.get("data", ""):
+            candidate = title_el.attrs.get("data", "")
+        elif type_attr:
+            candidate = type_attr
+        elif raw_data and not raw_data.isdigit():
+            candidate = raw_data
+        elif raw_data and raw_data.isdigit() and len(raw_data) <= 2:
+            candidate = raw_data  # 短数字才可能是题型码
+        if candidate not in ("", None):
+            mapped = _get_question_type(candidate)
+            if mapped != "unknown":
+                q_type = mapped
     # 去掉题干里的题型前缀
     title = _strip_type_prefix(raw_title)
 
@@ -344,13 +356,13 @@ def _process_exam_question(node, idx: int, font_decoder=None) -> Optional[Dict[s
     # 答题页通常不显示答案（提交前），尽力尝试
     answer, analysis = _extract_answer_and_analysis(node, font_decoder)
 
-    qid = node.attrs.get("data", "") or node.attrs.get("id", "") or f"q{idx+1}"
+    qid = raw_data or node.attrs.get("id", "") or f"q{idx+1}"
     return {
         "id": str(qid),
         "title": title,
         "options": options,
         "type": q_type,
-        "type_code": str(type_code),
+        "type_code": str(raw_data),
         "answer": answer,
         "analysis": analysis,
     }
