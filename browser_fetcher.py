@@ -24,7 +24,8 @@ from quiz_fetcher import question_fingerprint, QuizFetcher
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 # 答题页 DOM 里题目可能出现的容器特征（命中其一即认为题目已渲染）
-QUESTION_MARKERS = ["singleQuesId", "TiMu", "questionLi", "Cy_ulTk", "mark_name", "queTitle"]
+QUESTION_MARKERS = ["singleQuesId", "TiMu", "questionLi", "Cy_ulTk", "mark_name",
+                    "queTitle", "mark_letter", "qtContent", "timubox"]
 
 
 class BrowserGrabber:
@@ -33,6 +34,7 @@ class BrowserGrabber:
         self.cx = chaoxing
         self._cb = progress_cb
         self.headless = headless
+        self._dumped_sample = False
 
     def _emit(self, msg: str):
         logger.info(msg)
@@ -222,6 +224,11 @@ class BrowserGrabber:
 
     def _parse(self, html: str, paper_id) -> List[Dict]:
         """解析答题页 HTML。先用现成解析器，失败则落盘原始 HTML 供校准。"""
+        # 首份卷子无论成功与否，都留存一份原始 HTML，便于核对真实结构
+        if not self._dumped_sample:
+            self._dump_html(html, f"sample_answerpage_{paper_id}.html")
+            self._dumped_sample = True
+
         parsed = decode_questions_info(html)
         qs = parsed.get("questions", [])
         if qs:
@@ -230,13 +237,18 @@ class BrowserGrabber:
                 "title": q.get("title", ""), "options": q.get("options", []),
                 "answer": q.get("answer", ""), "analysis": q.get("analysis", ""),
             } for q in qs]
-        # 解析为空：落盘
+        # 解析为空：落盘（带 debug 前缀，醒目）
+        self._dump_html(html, f"debug_answerpage_{paper_id}.html")
+        self._emit(f"题目页结构未匹配，已保存到 output/debug_answerpage_{paper_id}.html（请反馈给开发者校准）")
+        return []
+
+    def _dump_html(self, html: str, filename: str):
+        if not html:
+            return
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
-            path = os.path.join(OUTPUT_DIR, f"debug_answerpage_{paper_id}.html")
-            with open(path, "w", encoding="utf-8") as f:
+            with open(os.path.join(OUTPUT_DIR, filename), "w", encoding="utf-8") as f:
                 f.write(html)
-            self._emit(f"题目页结构未匹配，已保存到 {path}（请反馈给开发者校准）")
-        except Exception:
-            pass
-        return []
+            logger.info(f"已保存答题页 HTML: output/{filename}（{len(html)} 字符）")
+        except Exception as e:
+            logger.debug(f"保存 HTML 失败: {e}")

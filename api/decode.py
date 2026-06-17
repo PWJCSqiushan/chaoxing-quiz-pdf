@@ -233,15 +233,161 @@ def decode_questions_info(html_content: str) -> Dict[str, Any]:
 
     questions = []
     form = soup.find("form")
-    if form:
-        for div_tag in form.find_all("div", class_="singleQuesId"):
-            question = _process_question(div_tag, font_decoder)
-            if question:
-                questions.append(question)
+    container = form if form else soup
+    for div_tag in container.find_all("div", class_="singleQuesId"):
+        question = _process_question(div_tag, font_decoder)
+        if question:
+            questions.append(question)
+
+    # 作业页结构（singleQuesId）未命中时，回退到考试/自测答题页结构解析
+    if not questions:
+        questions = decode_exam_questions(soup, font_decoder)
 
     form_data["questions"] = questions
     form_data["answerwqbid"] = ",".join([q["id"] for q in questions]) + ","
     return form_data
+
+
+# ==================== 考试 / 自测答题页解析（结构不同于作业页） ====================
+
+# 考试答题页里题目容器可能用到的 class（按出现概率排序）
+_EXAM_Q_SELECTORS = [
+    "div.questionLi",
+    "div.TiMu",
+    "div.timu",
+    "div.Cy_ulTk",
+    "div.queText",
+]
+# 题干元素候选 class
+_EXAM_TITLE_SELECTORS = [
+    "div.mark_name", "h3.mark_name", "div.Zy_TItle", "div.Cy_TItle",
+    "div.qtContent", "h3", "div.queTitle",
+]
+# 选项容器候选 class
+_EXAM_OPTION_SELECTORS = ["ul.mark_letter", "ul.Cy_ulb", "ul.cyTk", "ul"]
+
+
+def decode_exam_questions(soup_or_html, font_decoder=None) -> List[Dict[str, Any]]:
+    """
+    解析超星考试 / 自测答题页（reVersionTestStartNew / lookPaper）题目。
+
+    该页面与作业页（singleQuesId）结构不同，常见为：
+        <div class="questionLi" data="题型码" ...>
+            <div class="mark_name">序号 / 题型 / 题干</div>
+            <ul class="mark_letter"><li>A. xxx</li>...</ul>
+        </div>
+    本函数对多种容器/题干/选项 class 做兼容，尽量稳健。
+    """
+    if isinstance(soup_or_html, str):
+        soup = BeautifulSoup(soup_or_html, "lxml")
+    else:
+        soup = soup_or_html
+
+    containers = []
+    for sel in _EXAM_Q_SELECTORS:
+        name, cls = sel.split(".", 1)
+        found = soup.find_all(name, class_=cls)
+        if found:
+            containers = found
+            logger.debug(f"考试题目容器命中: {sel}（{len(found)} 个）")
+            break
+
+    questions: List[Dict[str, Any]] = []
+    for idx, node in enumerate(containers):
+        q = _process_exam_question(node, idx, font_decoder)
+        if q and q.get("title"):
+            questions.append(q)
+    if questions:
+        logger.info(f"考试页结构解析到 {len(questions)} 题")
+    return questions
+
+
+def _process_exam_question(node, idx: int, font_decoder=None) -> Optional[Dict[str, Any]]:
+    """解析单个考试题目容器。"""
+    # 题型：优先取容器或题干元素的 data 属性，其次从题干文字里的 “（单选题）” 推断
+    type_code = node.attrs.get("data", "") or node.attrs.get("type", "")
+
+    # 题干
+    title_el = None
+    for sel in _EXAM_TITLE_SELECTORS:
+        name, cls = (sel.split(".", 1) + [""])[:2]
+        title_el = node.find(name, class_=cls) if cls else node.find(name)
+        if title_el:
+            break
+    raw_title = _extract_title(title_el, font_decoder) if title_el else ""
+    if not type_code and title_el:
+        type_code = title_el.attrs.get("data", "") or type_code
+
+    # 从题干文字推断题型（如 “（单选题）”“【多选题】”）
+    inferred = _infer_type_from_text(raw_title)
+    q_type = _get_question_type(type_code) if type_code not in ("", None) else inferred
+    if q_type == "unknown" and inferred != "unknown":
+        q_type = inferred
+    # 去掉题干里的题型前缀
+    title = _strip_type_prefix(raw_title)
+
+    # 选项
+    options: List[str] = []
+    opt_ul = None
+    for sel in _EXAM_OPTION_SELECTORS:
+        name, cls = (sel.split(".", 1) + [""])[:2]
+        opt_ul = node.find(name, class_=cls) if cls else node.find(name)
+        if opt_ul and opt_ul.find_all("li"):
+            break
+    if opt_ul:
+        for li in opt_ul.find_all("li"):
+            txt = _extract_choices(li, font_decoder)
+            if txt:
+                options.append(txt)
+    options = [o for o in options if o]
+
+    # 答题页通常不显示答案（提交前），尽力尝试
+    answer, analysis = _extract_answer_and_analysis(node, font_decoder)
+
+    qid = node.attrs.get("data", "") or node.attrs.get("id", "") or f"q{idx+1}"
+    return {
+        "id": str(qid),
+        "title": title,
+        "options": options,
+        "type": q_type,
+        "type_code": str(type_code),
+        "answer": answer,
+        "analysis": analysis,
+    }
+
+
+def _infer_type_from_text(text: str) -> str:
+    """从题干文字里的题型标注推断题型。"""
+    if not text:
+        return "unknown"
+    head = text[:20]
+    if "单选" in head:
+        return "single"
+    if "多选" in head:
+        return "multiple"
+    if "判断" in head:
+        return "judgement"
+    if "填空" in head:
+        return "completion"
+    if any(k in head for k in ("简答", "论述", "名词解释", "问答")):
+        return "shortanswer"
+    return "unknown"
+
+
+def _strip_type_prefix(title: str) -> str:
+    """去掉题干开头的 “（单选题）/【多选题】/1.” 等前缀（可能多种前缀叠加，循环剥离）。"""
+    if not title:
+        return ""
+    t = title.strip()
+    type_re = re.compile(r"^\s*[（(【\[]\s*(单选|多选|判断|填空|简答|论述|问答|名词解释)题?\s*[）)】\]]\s*")
+    num_re = re.compile(r"^\s*\d{1,3}\s*[、.．)]\s*")
+    for _ in range(4):  # 最多剥 4 层，足够覆盖 “1.（单选题）” 这类组合
+        new = num_re.sub("", t)
+        new = type_re.sub("", new)
+        if new == t:
+            break
+        t = new
+    return t.strip()
 
 
 def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
