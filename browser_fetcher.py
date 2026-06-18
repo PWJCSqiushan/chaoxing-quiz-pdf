@@ -119,9 +119,11 @@ class BrowserGrabber:
                         self._emit("未定位到自测卷入口，跳过")
                         continue
 
-                    # —— 浏览器里打开答题流程 ——
-                    html = self._open_and_extract(context, page, course, entry, per_paper_timeout)
-                    if not html:
+                    # —— 浏览器里打开答题流程，并逐题翻页抓取整卷 ——
+                    before = len(collected)
+                    qs = self._open_and_collect(context, page, course, entry,
+                                                paper_id, per_paper_timeout)
+                    if not qs:
                         self._emit("本份未取到题目页（超时或被关闭）")
                         empty_streak += 1
                         if empty_streak >= 2:
@@ -129,8 +131,6 @@ class BrowserGrabber:
                             break
                         continue
 
-                    before = len(collected)
-                    qs = self._parse(html, paper_id)
                     for q in qs:
                         q["source"] = f"{course.get('title','')} 自测"
                         fp = question_fingerprint(q)
@@ -159,10 +159,11 @@ class BrowserGrabber:
 
         return QuizFetcher._sort(list(collected.values()))
 
-    def _open_and_extract(self, context, page, course: Dict, entry: Dict,
-                          timeout: int) -> Optional[str]:
+    def _open_and_collect(self, context, page, course: Dict, entry: Dict,
+                          paper_id, timeout: int) -> List[Dict]:
         """
-        在浏览器打开 examnotes → 进入考试 → (用户过验证码) → 答题页，提取题目 HTML。
+        打开 examnotes → 进入考试 →(用户过验证码)→ 答题页；
+        然后逐题翻页（&start=N）抓取整卷所有题目。
         """
         examnotes = (
             f"{self.cx.EXAM_HOST}/exam/test/examcode/examnotes"
@@ -193,34 +194,89 @@ class BrowserGrabber:
                 clicked = True
             answer_page = pop.value
         except Exception:
-            # 没有新开标签：若上面因点击前就异常未点到，则补点一次（同页跳转）
             if not clicked:
                 self._click_enter(page)
             answer_page = self._latest_question_page(context) or page
 
-        # 轮询等待题目渲染（用户此时在过验证码）
+        # 等待第一题渲染（用户此时在过验证码）
+        first_html = self._wait_rendered(context, answer_page, timeout)
+        if not first_html:
+            return []
+        ap = self._latest_question_page(context) or answer_page
+
+        # 落盘首页样本（便于校准）
+        if not self._dumped_sample:
+            self._dump_html(first_html, f"sample_answerpage_{paper_id}.html")
+            self._dumped_sample = True
+
+        # 解析首页：拿总题数 + 第 0 题
+        from api.decode import decode_exam_page
+        first = decode_exam_page(first_html)
+        total = first.get("total", 0) or 1
+        self._emit(f"答题页共 {total} 题，开始逐题抓取…")
+
+        results: List[Dict] = []
+        seen_ids = set()
+        for q in first.get("questions", []):
+            results.append(q)
+            if q.get("id"):
+                seen_ids.add(q["id"])
+
+        # 逐题翻页：start=1..total-1。复用答题页 URL，仅改 start 参数。
+        base_url = ap.url
+        for n in range(1, total):
+            url = self._with_start(base_url, n)
+            try:
+                ap.goto(url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as e:
+                logger.debug(f"翻到第 {n+1} 题失败: {e}")
+                continue
+            html = self._wait_rendered(context, ap, 30, quiet=True)
+            if not html:
+                self._emit(f"第 {n+1} 题渲染超时，跳过")
+                continue
+            parsed = decode_exam_page(html)
+            for q in parsed.get("questions", []):
+                if q.get("id") and q["id"] in seen_ids:
+                    continue
+                if q.get("id"):
+                    seen_ids.add(q["id"])
+                results.append(q)
+            if (n + 1) % 5 == 0:
+                self._emit(f"已抓取 {len(results)}/{total} 题…")
+        self._emit(f"本卷共抓取 {len(results)} 题")
+        return results
+
+    @staticmethod
+    def _with_start(url: str, n: int) -> str:
+        """把 URL 里的 start 参数替换/追加为 n。"""
+        if re.search(r"[?&]start=", url):
+            return re.sub(r"([?&]start=)\d+", lambda m: f"{m.group(1)}{n}", url)
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}start={n}"
+
+    def _wait_rendered(self, context, answer_page, timeout: int, quiet: bool = False) -> Optional[str]:
+        """轮询等待题目容器渲染完成，返回页面 HTML。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             ap = self._latest_question_page(context) or answer_page
-            # DOM 级判定：真正存在题目容器元素，且容器内有���本，才算渲染完成
             rendered = False
             try:
-                loc = ap.locator(
-                    "div.singleQuesId, div.questionLi, div.TiMu, div.timu, div.Cy_ulTk"
-                )
+                loc = ap.locator("div.questionLi, div.singleQuesId, div.stem_answer, h3.mark_name")
                 if loc.count() > 0:
                     txt = (loc.first.inner_text(timeout=1500) or "").strip()
                     rendered = len(txt) > 0
             except Exception:
                 rendered = False
             if rendered:
-                self._emit("✓ 检测到题目已渲染，正在提取…")
-                time.sleep(1.0)
+                if not quiet:
+                    self._emit("✓ 检测到题目已渲染，开始抓取…")
+                time.sleep(0.6)
                 try:
                     return ap.content()
                 except Exception:
                     return None
-            time.sleep(2.0)
+            time.sleep(1.5)
         return None
 
     def _click_enter(self, page):

@@ -116,6 +116,16 @@ chaoxing-quiz-pdf/
 4. `GET  /exam-ans/mooc2/exam/exam-list` —— 解析列表里 `goTest(courseId, tId, relationId, endTime, paperId, isRetest, enc)`，按 `paperId` 定位本卷的 `tId / relationId / enc`；
 5. `GET  /exam-ans/exam/lookPaper?...&isPreview=true`（或 `reVersionTestStartNew`）—— 取整卷题目 HTML，用 `decode_questions_info` 解析。
 
+> **答题页是「逐题加载」的**：一次只渲染当前一题，其余题目通过 `reVersionTestStartNew?...&start=N`
+> 整页翻页加载。浏览器半自动模式会先读答题卡得到总题数，再**逐题翻页**抓全整卷
+> （`browser_fetcher._open_and_collect`）。
+>
+> **公式/图片题**：题干和选项里的数学公式多为 `<img src="https://p.ananas.chaoxing.com/...png">`。
+> 解析器（`api/decode.decode_exam_page`）保留图片 URL，PDF 生成时下载并**内嵌**到对应位置
+> （带 `Referer` 头绕过图床防盗链）。可设 `PDF_EMBED_IMAGES=0` 关闭，降级为 `[公式]` 占位。
+>
+> **答案**：自测做题页本身不含正确答案；缺答案的题可开启「AI 生成解析」由大模型补全。
+
 **反复新建自测 + 题干指纹去重**即可逼近完整题库（单卷上限常见 500 题）。
 相关接口集中在 `api/base.py` 的 `Chaoxing.EXAM_HOST` 与 `*selftest*` 方法。
 抓不到答案/解析的题，可开启「AI 生成解析」补全。

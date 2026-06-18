@@ -236,16 +236,181 @@ def decode_questions_info(html_content: str) -> Dict[str, Any]:
     container = form if form else soup
     for div_tag in container.find_all("div", class_="singleQuesId"):
         question = _process_question(div_tag, font_decoder)
-        if question:
+        if question and question.get("title"):
             questions.append(question)
 
     # 作业页结构（singleQuesId）未命中时，回退到考试/自测答题页结构解析
     if not questions:
-        questions = decode_exam_questions(soup, font_decoder)
+        # 先尝试真实考试答题页（whiteDiv questionLi singleQuesId + stem_answer/singleoption）
+        exam_page = decode_exam_page(soup, font_decoder)
+        if exam_page.get("questions"):
+            questions = exam_page["questions"]
+        else:
+            questions = decode_exam_questions(soup, font_decoder)
 
     form_data["questions"] = questions
     form_data["answerwqbid"] = ",".join([q["id"] for q in questions]) + ","
     return form_data
+
+
+# ==================== 真实考试答题页解析（逐题加载页） ====================
+#
+# 超星自测/考试答题页（reVersionTestStartNew）一次只渲染“当前一题”，结构为：
+#   <div class="whiteDiv questionLi singleQuesId" data="题目ID">
+#     <h3 class="mark_name">序号. <span class="colorShallow">(单选题)</span> 题干...<img ...></h3>
+#     <input id="typeNameXXX" value="单选题">
+#     <div class="stem_answer">
+#       <div class="... singleoption"><span data="A">A</span><div class="answer_p">选项内容<img ...></div></div>
+#       ...
+#     </div>
+#   </div>
+# 其余题目通过答题卡 li[onclick="getTheQuestionByStart(N,...)"] 切换（&start=N 整页跳转）。
+# 题干/选项中的数学公式多为 <img src="https://p.ananas.chaoxing.com/...png">，需保留 URL。
+
+_EXAM_TYPE_NAME_MAP = {
+    "单选题": "single", "多选题": "multiple", "判断题": "judgement",
+    "填空题": "completion", "简答题": "shortanswer", "论述题": "shortanswer",
+    "名词解释": "shortanswer", "问答题": "shortanswer", "计算题": "shortanswer",
+    "分析题": "shortanswer", "其它": "unknown", "其他": "unknown",
+}
+
+
+def _extract_rich_text(element, font_decoder=None) -> str:
+    """提取元素文本，<img> 转为 【图片: URL】 标记保留（供 PDF 下载内嵌），支持字体解码。"""
+    if not element:
+        return ""
+    parts = []
+    for item in element.descendants:
+        if isinstance(item, NavigableString):
+            parts.append(item.string or "")
+        elif getattr(item, "name", None) == "img":
+            url = item.get("src") or item.get("data-original") or ""
+            if url:
+                if url.startswith("//"):
+                    url = "https:" + url
+                parts.append(f"【图片: {url}】")
+    text = "".join(parts)
+    text = re.sub(r"[\r\t\n]+", "", text).strip()
+    if font_decoder:
+        try:
+            text = font_decoder.decode(text)
+        except Exception:
+            pass
+    return text
+
+
+def exam_page_total(soup_or_html) -> int:
+    """读取答题卡里的题目总数（li[onclick^=getTheQuestionByStart] 的数量）。"""
+    soup = BeautifulSoup(soup_or_html, "lxml") if isinstance(soup_or_html, str) else soup_or_html
+    lis = soup.find_all("li", onclick=re.compile(r"getTheQuestionByStart"))
+    return len(lis)
+
+
+def decode_exam_page(soup_or_html, font_decoder=None) -> Dict[str, Any]:
+    """
+    解析“逐题加载”的真实考试答题页，返回：
+      {"questions": [一题], "total": 总题数, "paper_id": str, "test_paper_id": str}
+    若结构不匹配返回空 questions。
+    """
+    soup = BeautifulSoup(soup_or_html, "lxml") if isinstance(soup_or_html, str) else soup_or_html
+
+    # 题目容器：whiteDiv + questionLi + singleQuesId（同时具备 stem_answer 才是真实答题页）
+    container = None
+    for div in soup.find_all("div", class_="questionLi"):
+        if div.find("div", class_="stem_answer") or div.find("h3", class_="mark_name"):
+            container = div
+            break
+    result: Dict[str, Any] = {
+        "questions": [], "total": exam_page_total(soup),
+        "paper_id": "", "test_paper_id": "",
+    }
+    pid = soup.find("input", id="paperId")
+    tpid = soup.find("input", id="testPaperId")
+    if pid and pid.get("value"):
+        result["paper_id"] = pid["value"]
+    if tpid and tpid.get("value"):
+        result["test_paper_id"] = tpid["value"]
+
+    if not container:
+        return result
+
+    q = _process_exam_single(container, soup, font_decoder)
+    if q and q.get("title"):
+        result["questions"] = [q]
+    return result
+
+
+def _process_exam_single(container, soup, font_decoder=None) -> Optional[Dict[str, Any]]:
+    """解析真实考试答题页的单道题。"""
+    qid = container.attrs.get("data", "") or ""
+
+    # 题型：优先 typeNameXXX 隐藏域，其次题干里的 “(单选题)”
+    q_type = "unknown"
+    type_input = None
+    if qid:
+        type_input = soup.find("input", id=f"typeName{qid}")
+    if type_input is None:
+        type_input = soup.find("input", id=re.compile(r"^typeName\d+$"))
+    if type_input and type_input.get("value"):
+        q_type = _EXAM_TYPE_NAME_MAP.get(type_input["value"].strip(), "unknown")
+
+    # 题干：h3.mark_name，去掉序号与 (单选题) 前缀，保留图片
+    title = ""
+    mark = container.find("h3", class_="mark_name")
+    if mark:
+        # 单独剥离题型标注 span
+        span = mark.find("span", class_="colorShallow")
+        if span:
+            if q_type == "unknown":
+                q_type = _infer_type_from_text(span.get_text())
+            span.extract()
+        title = _extract_rich_text(mark, font_decoder)
+        title = _strip_type_prefix(title)
+    if q_type == "unknown":
+        q_type = _infer_type_from_text(title)
+
+    # 选项：div.stem_answer 下的 singleoption / 选项块
+    options: List[str] = []
+    stem = container.find("div", class_="stem_answer")
+    if stem:
+        opt_divs = stem.find_all("div", class_=re.compile(r"singleoption|multioption|answerBg"))
+        seen_letters = set()
+        for od in opt_divs:
+            letter_el = od.find("span", attrs={"data": True})
+            letter = (letter_el.get("data") or "").strip() if letter_el else ""
+            # 选项正文
+            content_el = od.find("div", class_=re.compile(r"answer_p"))
+            content = _extract_rich_text(content_el, font_decoder) if content_el else ""
+            if not content:
+                # 兜底：取整块去掉字母
+                content = _extract_rich_text(od, font_decoder)
+                if letter and content.startswith(letter):
+                    content = content[len(letter):].lstrip(".、) ")
+            if letter and letter in seen_letters:
+                continue
+            if letter:
+                seen_letters.add(letter)
+                options.append(f"{letter}. {content}")
+            elif content:
+                options.append(content)
+
+    # 答案：做题页通常为空（answerXXX 隐藏域为空），尽力尝试
+    answer = ""
+    if qid:
+        ans_input = soup.find("input", id=f"answer{qid}")
+        if ans_input and (ans_input.get("value") or "").strip():
+            answer = ans_input["value"].strip()
+
+    return {
+        "id": str(qid),
+        "title": title,
+        "options": options,
+        "type": q_type,
+        "type_code": "",
+        "answer": answer,
+        "analysis": "",
+    }
+
 
 
 # ==================== 考试 / 自测答题页解析（结构不同于作业页） ====================

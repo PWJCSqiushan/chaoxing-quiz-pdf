@@ -10,6 +10,8 @@ loguru>=0.7.0
 tqdm>=4.66.0
 # 加密存储超星密码（AES-GCM）。未安装时自动降级为内置 keystream 方案。
 cryptography>=42.0.0
+# 公式图片尺寸读取（PDF 内嵌排版更精确）。未安装时回退 fpdf2 内置解析。
+Pillow>=10.0.0
 
 # 浏览器半自动抓题（绕过自测滑块验证码）需要：
 #   pip install playwright  &&  python -m playwright install chromium

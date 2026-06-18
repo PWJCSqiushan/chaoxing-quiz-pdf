@@ -10,13 +10,26 @@ PDF 试卷生成模块（基于 fpdf2）。
 中文字体：优先使用 fonts/ 目录下打包字体，其次系统字体。
 """
 import os
+import re
+import io
 import time
+import hashlib
+import tempfile
+import threading
 from typing import Dict, List, Optional
 
+import requests
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 from api.logger import logger
+
+# 公式/题图缓存目录与下载并发锁
+_IMG_CACHE_DIR = os.path.join(tempfile.gettempdir(), "cx_quiz_imgs")
+_IMG_LOCK = threading.Lock()
+_IMG_MARKER = re.compile(r"【图片:\s*(.*?)】")
+# 是否下载并内嵌公式图片（用户可关闭则降级为 [公式] 占位）
+_EMBED_IMAGES = os.environ.get("PDF_EMBED_IMAGES", "1") == "1"
 
 _TYPE_NAMES = {
     "single": "一、单选题",
@@ -200,13 +213,135 @@ def build_quiz_pdf(
     return output_path
 
 
+def _download_image(url: str) -> Optional[str]:
+    """下载公式/题图到本地缓存，返回本地路径；失败返回 None。"""
+    if not url:
+        return None
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
+        ext = os.path.splitext(url.split("?")[0])[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".bmp"):
+            ext = ".png"
+        key = hashlib.md5(url.encode("utf-8")).hexdigest() + ext
+        path = os.path.join(_IMG_CACHE_DIR, key)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        with _IMG_LOCK:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+            headers = {
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"),
+                "Referer": "https://mooc1.chaoxing.com/",
+            }
+            resp = requests.get(url, headers=headers, timeout=15)
+            ctype = resp.headers.get("Content-Type", "")
+            if resp.status_code == 200 and resp.content and "image" in ctype:
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                return path
+            logger.debug(f"下载图片非图片响应 {resp.status_code} {ctype} {url}")
+    except Exception as e:
+        logger.debug(f"下载图片失败 {url}: {type(e).__name__}")
+    return None
+
+
+def _img_size(path: str):
+    """读取图片像素尺寸 (w, h)，失败返回 (2, 1)（横向估计，避免过宽）。"""
+    # 优先用 PIL
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        pass
+    # 退而求其次：用 fpdf2 内置图片解析器
+    try:
+        from fpdf.image_parsing import get_img_info
+        with open(path, "rb") as f:
+            info = get_img_info(f.read())
+        return (info["w"], info["h"])
+    except Exception:
+        return (2, 1)
+
+
+def _render_rich(pdf: QuizPDF, h: float, text: str, indent: float = 0.0):
+    """
+    渲染含 【图片: URL】 标记的富文本：文字按字符排版（中文无空格需手动断行），
+    图片下载后等比内嵌到约 1 行文字高度，行内插入；下载失败降级为 [公式]。
+    """
+    text = _safe(text)
+    if not _IMG_MARKER.search(text):
+        _mc(pdf, h, text)  # 纯文本，普通换行
+        return
+
+    left = pdf.l_margin + indent
+    right = pdf.w - pdf.r_margin
+    line_h = h
+    img_h = max(3.0, h - 1.2)
+    x = left
+    y = pdf.get_y()
+
+    def newline():
+        nonlocal x, y
+        x = left
+        y += line_h
+        # 接近页底则换页
+        if y + line_h > pdf.h - pdf.b_margin:
+            pdf.add_page()
+            y = pdf.get_y()
+
+    parts = _IMG_MARKER.split(text)  # 偶数=文字，奇数=URL
+    for i, seg in enumerate(parts):
+        if i % 2 == 0:
+            for ch in seg:
+                if ch in ("　",):
+                    ch = " "
+                w = pdf.get_string_width(ch) or 1
+                if x + w > right:
+                    newline()
+                pdf.set_xy(x, y)
+                pdf.cell(w, line_h, ch)
+                x += w
+        else:
+            url = seg.strip()
+            local = _download_image(url) if _EMBED_IMAGES else None
+            drawn = False
+            if local:
+                try:
+                    iw, ih = _img_size(local)
+                    draw_h = img_h
+                    draw_w = (iw / ih) * draw_h if ih else draw_h
+                    draw_w = min(draw_w, right - left)
+                    if x + draw_w > right:
+                        newline()
+                    pdf.image(local, x=x, y=y + 0.6, h=draw_h)
+                    x += draw_w + 0.5
+                    drawn = True
+                except Exception as e:
+                    logger.debug(f"内嵌图片失败: {type(e).__name__}")
+            if not drawn:
+                ph = "[公式]"
+                w = pdf.get_string_width(ph)
+                if x + w > right:
+                    newline()
+                pdf.set_xy(x, y)
+                pdf.set_text_color(150, 150, 150)
+                pdf.cell(w, line_h, ph)
+                pdf.set_text_color(0, 0, 0)
+                x += w
+    pdf.set_xy(pdf.l_margin, y + line_h)
+
+
 def _render_question(pdf: QuizPDF, no: int, q: Dict, with_answer: bool = False):
     pdf.set_font("cjk", "", 11)
-    title = _safe(q.get("title", ""))
-    _mc(pdf, 7, f"{no}. {title}")
+    title = q.get("title", "")
+    _render_rich(pdf, 7, f"{no}. {title}")
     # 选项
     for opt in q.get("options", []):
-        _mc(pdf, 6.5, "    " + _safe(opt))
+        _render_rich(pdf, 6.5, "    " + _safe(opt))
     # 作答区
     qtype = q.get("type")
     if qtype == "judgement":
