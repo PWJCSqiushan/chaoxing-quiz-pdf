@@ -143,6 +143,10 @@ def build_quiz_pdf(
             "或在系统中安装中文字体。"
         )
 
+    # 并发预下载所有公式图片，避免渲染时逐张串行下载拖慢速度
+    if _EMBED_IMAGES:
+        _prefetch_images(questions)
+
     pdf = QuizPDF(font_path, title)
     groups = _group_by_type(questions)
     total = len(questions)
@@ -248,9 +252,31 @@ def _download_image(url: str) -> Optional[str]:
     return None
 
 
+def _prefetch_images(questions: List[Dict]):
+    """并发预下载题目里所有公式图片到缓存，避免渲染时逐张串行下载。"""
+    urls = set()
+    for q in questions:
+        for field in (q.get("title", ""), q.get("answer", ""), q.get("analysis", "")):
+            for m in _IMG_MARKER.findall(field or ""):
+                urls.add(m.strip())
+        for opt in q.get("options", []) or []:
+            for m in _IMG_MARKER.findall(opt or ""):
+                urls.add(m.strip())
+    urls = [u for u in urls if u]
+    if not urls:
+        return
+    logger.info(f"预下载公式图片 {len(urls)} 张…")
+    from concurrent.futures import ThreadPoolExecutor
+    ok = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(_download_image, urls):
+            if r:
+                ok += 1
+    logger.info(f"公式图片预下载完成：成功 {ok}/{len(urls)}")
+
+
 def _img_size(path: str):
     """读取图片像素尺寸 (w, h)，失败返回 (2, 1)（横向估计，避免过宽）。"""
-    # 优先用 PIL
     try:
         from PIL import Image
         with Image.open(path) as im:

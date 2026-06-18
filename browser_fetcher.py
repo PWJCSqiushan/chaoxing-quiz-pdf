@@ -213,7 +213,7 @@ class BrowserGrabber:
         from api.decode import decode_exam_page
         first = decode_exam_page(first_html)
         total = first.get("total", 0) or 1
-        self._emit(f"答题页共 {total} 题，开始逐题抓取…")
+        self._emit(f"答题页共 {total} 题，开始抓取…")
 
         results: List[Dict] = []
         seen_ids = set()
@@ -222,19 +222,40 @@ class BrowserGrabber:
             if q.get("id"):
                 seen_ids.add(q["id"])
 
-        # 逐题翻页：start=1..total-1。复用答题页 URL，仅改 start 参数。
         base_url = ap.url
+
+        # 关键加速：浏览器已过验证码，把其 cookie 同步回 requests 会话，
+        # 之后用 requests 高速抓取每一题（不渲染、不卡顿，比浏览器翻页快很多）。
+        use_requests = self._sync_cookies_to_session(context)
+        referer = base_url
+
         for n in range(1, total):
             url = self._with_start(base_url, n)
-            try:
-                ap.goto(url, wait_until="domcontentloaded", timeout=20000)
-            except Exception as e:
-                logger.debug(f"翻到第 {n+1} 题失败: {e}")
-                continue
-            html = self._wait_rendered(context, ap, 30, quiet=True)
+            html = None
+
+            # 优先 requests 抓取
+            if use_requests:
+                html = self._fetch_by_requests(url, referer)
+                if html is None:
+                    # requests 被拦/失效：本题及后续回退浏览器
+                    logger.debug(f"requests 抓第 {n+1} 题失败，回退浏览器")
+                    use_requests = False
+
+            # 浏览器回退
+            if html is None:
+                try:
+                    ap.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    html = self._wait_rendered(context, ap, 25, quiet=True)
+                except Exception as e:
+                    logger.debug(f"翻到第 {n+1} 题失败: {e}")
+                # 浏览器抓成功后，尝试再次同步 cookie 恢复 requests 通道
+                if html:
+                    use_requests = self._sync_cookies_to_session(context)
+
             if not html:
-                self._emit(f"第 {n+1} 题渲染超时，跳过")
+                self._emit(f"第 {n+1} 题获取失败，跳过")
                 continue
+
             parsed = decode_exam_page(html)
             for q in parsed.get("questions", []):
                 if q.get("id") and q["id"] in seen_ids:
@@ -242,10 +263,43 @@ class BrowserGrabber:
                 if q.get("id"):
                     seen_ids.add(q["id"])
                 results.append(q)
-            if (n + 1) % 5 == 0:
+            if (n + 1) % 10 == 0:
                 self._emit(f"已抓取 {len(results)}/{total} 题…")
         self._emit(f"本卷共抓取 {len(results)} 题")
         return results
+
+    def _sync_cookies_to_session(self, context) -> bool:
+        """把浏览器 context 的 cookie 同步到 requests 会话，返回是否成功。"""
+        try:
+            for c in context.cookies():
+                self.cx.session.cookies.set(
+                    c["name"], c["value"],
+                    domain=c.get("domain") or None,
+                    path=c.get("path") or "/",
+                )
+            return True
+        except Exception as e:
+            logger.debug(f"同步 cookie 失败: {e}")
+            return False
+
+    def _fetch_by_requests(self, url: str, referer: str) -> Optional[str]:
+        """用 requests 抓单题答题页 HTML；被拦/异常返回 None。"""
+        try:
+            resp = self.cx.session.get(url, headers={"Referer": referer}, timeout=20)
+        except Exception as e:
+            logger.debug(f"requests 抓题异常: {e}")
+            return None
+        if resp.status_code != 200 or not resp.text:
+            return None
+        text = resp.text
+        # 命中题目结构且非拦截页才算成功
+        if ("无操作权限" in text or "长时间没有操作" in text
+                or "validate" in text.lower() and "questionLi" not in text):
+            return None
+        if "questionLi" in text or "mark_name" in text or "stem_answer" in text:
+            return text
+        return None
+
 
     @staticmethod
     def _with_start(url: str, n: int) -> str:
