@@ -223,50 +223,98 @@ class BrowserGrabber:
                 seen_ids.add(q["id"])
 
         base_url = ap.url
-
-        # 关键加速：浏览器已过验证码，把其 cookie 同步回 requests 会话，
-        # 之后用 requests 高速抓取每一题（不渲染、不卡顿，比浏览器翻页快很多）。
-        use_requests = self._sync_cookies_to_session(context)
         referer = base_url
+
+        # 把浏览器 cookie + User-Agent 同步给 requests 会话。
+        # UA 必须一致：会话是用浏览器 UA 过的验证码，UA 不符时超星会忽略 start 参数、
+        # 始终返回第 0 题（这正是“只抓到第一题”的根因）。
+        use_requests = self._sync_cookies_to_session(context)
+        try:
+            self._browser_ua = ap.evaluate("() => navigator.userAgent")
+        except Exception:
+            self._browser_ua = None
+
+        last_id = results[-1]["id"] if results else None
 
         for n in range(1, total):
             url = self._with_start(base_url, n)
-            html = None
+            qs = None
 
-            # 优先 requests 抓取
+            # 快速通道：requests
             if use_requests:
                 html = self._fetch_by_requests(url, referer)
-                if html is None:
-                    # requests 被拦/失效：本题及后续回退浏览器
-                    logger.debug(f"requests 抓第 {n+1} 题失败，回退浏览器")
+                qs = self._new_questions(html, seen_ids)
+                if not qs:
+                    # 没换到新题（多半 server 忽略 start 返回旧题）→ 退回浏览器翻页
                     use_requests = False
+                    self._emit("requests 未能翻页，改用浏览器逐题翻页（较慢但可靠）")
 
-            # 浏览器回退
-            if html is None:
-                try:
-                    ap.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    html = self._wait_rendered(context, ap, 25, quiet=True)
-                except Exception as e:
-                    logger.debug(f"翻到第 {n+1} 题失败: {e}")
-                # 浏览器抓成功后，尝试再次同步 cookie 恢复 requests 通道
-                if html:
-                    use_requests = self._sync_cookies_to_session(context)
+            # 可靠通道：浏览器用站点自身的翻页函数 getTheQuestionByStart（提交+导航）
+            if not qs:
+                html = self._browser_navigate(ap, context, n, url)
+                qs = self._new_questions(html, seen_ids)
 
-            if not html:
+            if not qs:
                 self._emit(f"第 {n+1} 题获取失败，跳过")
                 continue
 
-            parsed = decode_exam_page(html)
-            for q in parsed.get("questions", []):
-                if q.get("id") and q["id"] in seen_ids:
-                    continue
+            for q in qs:
                 if q.get("id"):
                     seen_ids.add(q["id"])
+                    last_id = q["id"]
                 results.append(q)
-            if (n + 1) % 10 == 0:
+            if (n + 1) % 5 == 0:
                 self._emit(f"已抓取 {len(results)}/{total} 题…")
         self._emit(f"本卷共抓取 {len(results)} 题")
         return results
+
+    def _new_questions(self, html: Optional[str], seen_ids: set) -> List[Dict]:
+        """解析 html，返回其中 id 未见过的新题（用于判断是否真的翻到了下一题）。"""
+        if not html:
+            return []
+        from api.decode import decode_exam_page
+        parsed = decode_exam_page(html)
+        out = []
+        for q in parsed.get("questions", []):
+            qid = q.get("id")
+            if qid and qid in seen_ids:
+                continue
+            out.append(q)
+        return out
+
+    def _browser_navigate(self, ap, context, n: int, url: str) -> Optional[str]:
+        """
+        浏览器翻到第 n 题：优先调用站点自身的 getTheQuestionByStart(n)（提交当前题再导航，
+        是超星推进 server 端题目位置的正道）；失败再直接 goto，并对 ERR_ABORTED 重试。
+        返回渲染后的页面 HTML。
+        """
+        ap = self._latest_question_page(context) or ap
+        # 1) 站点自身翻页函数
+        try:
+            has_fn = ap.evaluate("() => typeof getTheQuestionByStart === 'function'")
+        except Exception:
+            has_fn = False
+        if has_fn:
+            try:
+                with ap.expect_navigation(wait_until="load", timeout=15000):
+                    ap.evaluate("(n) => getTheQuestionByStart(n, '0')", n)
+                html = self._wait_rendered(context, ap, 15, quiet=True)
+                if html:
+                    return html
+            except Exception as e:
+                logger.debug(f"getTheQuestionByStart({n}) 失败: {e}")
+
+        # 2) 直接 goto，ERR_ABORTED 时重试
+        for attempt in range(2):
+            try:
+                ap.goto(url, wait_until="load", timeout=20000)
+                html = self._wait_rendered(context, ap, 18, quiet=True)
+                if html:
+                    return html
+            except Exception as e:
+                logger.debug(f"goto 第 {n+1} 题第 {attempt+1} 次失败: {e}")
+                time.sleep(1.0)
+        return None
 
     def _sync_cookies_to_session(self, context) -> bool:
         """把浏览器 context 的 cookie 同步到 requests 会话，返回是否成功。"""
@@ -283,18 +331,19 @@ class BrowserGrabber:
             return False
 
     def _fetch_by_requests(self, url: str, referer: str) -> Optional[str]:
-        """用 requests 抓单题答题页 HTML；被拦/异常返回 None。"""
+        """用 requests 抓单题答题页 HTML；被拦/异常返回 None。UA 与浏览器保持一致。"""
+        headers = {"Referer": referer}
+        if getattr(self, "_browser_ua", None):
+            headers["User-Agent"] = self._browser_ua
         try:
-            resp = self.cx.session.get(url, headers={"Referer": referer}, timeout=20)
+            resp = self.cx.session.get(url, headers=headers, timeout=20)
         except Exception as e:
             logger.debug(f"requests 抓题异常: {e}")
             return None
         if resp.status_code != 200 or not resp.text:
             return None
         text = resp.text
-        # 命中题目结构且非拦截页才算成功
-        if ("无操作权限" in text or "长时间没有操作" in text
-                or "validate" in text.lower() and "questionLi" not in text):
+        if "无操作权限" in text or "长时间没有操作" in text:
             return None
         if "questionLi" in text or "mark_name" in text or "stem_answer" in text:
             return text
