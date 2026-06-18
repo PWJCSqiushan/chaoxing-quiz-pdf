@@ -296,7 +296,10 @@ def _img_size(path: str):
 def _render_rich(pdf: QuizPDF, h: float, text: str, indent: float = 0.0):
     """
     渲染含 【图片: URL】 标记的富文本：文字按字符排版（中文无空格需手动断行），
-    图片下载后等比内嵌到约 1 行文字高度，行内插入；下载失败降级为 [公式]。
+    图片下载后等比内嵌到约 1 行文字高度，行内插入；下载失败降级为 [图]。
+
+    注意：手动排版期间**关闭 fpdf 自动分页**，由本函数统一管理 y 与换页——
+    否则 cell() 触发的自动分页会把 y 重置到页顶，与手动 y 失步，产生大量空白页。
     """
     text = _safe(text)
     if not _IMG_MARKER.search(text):
@@ -305,19 +308,29 @@ def _render_rich(pdf: QuizPDF, h: float, text: str, indent: float = 0.0):
 
     left = pdf.l_margin + indent
     right = pdf.w - pdf.r_margin
+    bottom = pdf.h - pdf.b_margin
     line_h = h
     img_h = max(3.0, h - 1.2)
+
+    # 关闭自动分页，自己管理（结束后恢复）
+    saved_auto = pdf.auto_page_break
+    saved_margin = pdf.b_margin
+    pdf.set_auto_page_break(False)
+
     x = left
     y = pdf.get_y()
+    # 起始就已接近页底则先换页
+    if y + line_h > bottom:
+        pdf.add_page()
+        y = pdf.t_margin
 
     def newline():
         nonlocal x, y
         x = left
         y += line_h
-        # 接近页底则换页
-        if y + line_h > pdf.h - pdf.b_margin:
+        if y + line_h > bottom:
             pdf.add_page()
-            y = pdf.get_y()
+            y = pdf.t_margin
 
     parts = _IMG_MARKER.split(text)  # 偶数=文字，奇数=URL
     for i, seg in enumerate(parts):
@@ -349,7 +362,7 @@ def _render_rich(pdf: QuizPDF, h: float, text: str, indent: float = 0.0):
                 except Exception as e:
                     logger.debug(f"内嵌图片失败: {type(e).__name__}")
             if not drawn:
-                ph = "[公式]"
+                ph = "[图]"
                 w = pdf.get_string_width(ph)
                 if x + w > right:
                     newline()
@@ -358,7 +371,14 @@ def _render_rich(pdf: QuizPDF, h: float, text: str, indent: float = 0.0):
                 pdf.cell(w, line_h, ph)
                 pdf.set_text_color(0, 0, 0)
                 x += w
-    pdf.set_xy(pdf.l_margin, y + line_h)
+
+    # 收尾：移到下一行起点；恢复自动分页
+    y_next = y + line_h
+    pdf.set_auto_page_break(saved_auto, margin=saved_margin)
+    if y_next + line_h > bottom:
+        pdf.add_page()
+    else:
+        pdf.set_xy(pdf.l_margin, y_next)
 
 
 def _render_question(pdf: QuizPDF, no: int, q: Dict, with_answer: bool = False):
